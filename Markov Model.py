@@ -6,7 +6,7 @@
 # -------------------------------------------------------------
 
 # === USER CONFIGURATION ===
-TICKER           = "QQQ"           # Yahoo Finance ticker
+TICKER           = "VSTS"           # Yahoo Finance ticker
 START_DATE       = "2000-01-01"     # Analysis start date (YYYY-MM-DD)
 END_DATE         = None              # End date (YYYY-MM-DD) or None for today
 PLOT             = False              # Show exploratory plots
@@ -51,6 +51,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from hmmlearn.hmm import GaussianHMM
+from scipy.stats import skew, kurtosis
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
@@ -148,6 +149,7 @@ def classify_risk_regimes() -> pd.DataFrame:
     if SAVE_PDF:
         with PdfPages(PDF_PATH) as pdf:
             _plot_summary_stats(out, pdf)
+            _plot_transition_matrix(out, pdf)
             _plot_price_shade(out, pdf)
             _plot_posteriors(out, pdf)
             _plot_return_hist(out, pdf)
@@ -155,6 +157,7 @@ def classify_risk_regimes() -> pd.DataFrame:
     # Show plots interactively if requested
     if PLOT:
         _plot_summary_stats(out)
+        _plot_transition_matrix(out)
         _plot_price_shade(out)
         _plot_posteriors(out)
         _plot_return_hist(out)
@@ -265,39 +268,188 @@ def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages = None):
     if PLOT: plt.show()
     plt.close(fig)
 
-def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages = None):
-    """First PDF page: summary statistics including regime counts, average and last posterior probabilities."""
-    # Compute counts, average and last posterior probability per regime
-    stats = []
+# -----------------------------------------------------------------------------
+# SUMMARY-PAGE PLOTTER (FIRST PAGE IN PDF)
+# -----------------------------------------------------------------------------
+
+def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
+    """First PDF page: key regime diagnostics (table only)."""
+    # Compute regime-level statistics
+    results = []
     for regime in REGIME_ORDER:
-        count = (df['regime'] == regime).sum()
-        posterior_col = df.get(f'prob_{regime}', pd.Series())
-        avg_prob = posterior_col.mean() if not posterior_col.empty else 0
-        last_prob = posterior_col.iloc[-1] if not posterior_col.empty else 0
-        stats.append([regime, count, round(avg_prob, 3), round(last_prob, 3)])
+        mask = df['regime'] == regime
+        if not mask.any():
+            continue
+        # choose return column
+        ret_col = 'ret' if 'ret' in df.columns else 'log_ret'
+        rets = df.loc[mask, ret_col]
+        count = mask.sum()
+        mean_ret = rets.mean()
+        ann_vol = rets.std() * np.sqrt(252)
+        sharpe = mean_ret / (ann_vol + 1e-9)
+        downside_std = rets[rets < 0].std() * np.sqrt(252)
+        sortino = mean_ret / (downside_std + 1e-9)
+        cum = (1 + rets).cumprod()
+        drawdown = (cum - cum.cummax()) / cum.cummax()
+        max_dd = drawdown.min()
+        sk = skew(rets)
+        kt = kurtosis(rets)
+        z_95 = 1.64485
+        var95 = -(mean_ret + z_95 * rets.std())
+        es95 = -mean_ret + rets.std() * (np.exp(-z_95**2/2)/(np.sqrt(2*np.pi)*(1-0.95)))
+        post_col = df.get(f'prob_{regime}', pd.Series(index=df.index, data=np.nan))
+        avg_post = post_col.mean()
+        last_post = post_col.iloc[-1] if not post_col.empty else np.nan
+        transitions = df['regime'].shift().fillna(regime).astype(str) + '_' + df['regime'].astype(str)
+        n_starts = (transitions == f'{regime}_{regime}').sum()
+        exp_dur = count / max(n_starts, 1)
+        results.append([
+            regime,
+            count,
+            round(mean_ret, 4),
+            round(ann_vol, 4),
+            round(sharpe, 2),
+            round(sortino, 2),
+            round(max_dd, 2),
+            round(sk, 2),
+            round(kt, 2),
+            round(var95, 4),
+            round(es95, 4),
+            round(avg_post, 3),
+            round(last_post, 3),
+            round(exp_dur, 1)
+        ])
+    col_labels = [
+        'Regime', 'Count', 'Mean', 'Ann σ', 'Sharpe', 'Sortino', 'MaxDD',
+        'Skew', 'Kurt', 'VaR95', 'ES95', 'Avg Post', 'Last Post', 'Exp Dur'
+    ]
 
-    # Create a table figure
-    fig, ax = plt.subplots(figsize=(6, 4))
-    col_labels = ['Regime', 'Count', 'Avg Posterior', 'Last Posterior']
-    table = ax.table(
-        cellText=stats,
-        colLabels=col_labels,
-        loc='center'
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 2)
-
+    # Build table figure
+    fig, ax = plt.subplots(figsize=(11, 8.5))
     ax.axis('off')
-    ax.set_title('Summary Statistics by Regime')
-    plt.tight_layout()
+    tbl = ax.table(
+        cellText=results,
+        colLabels=col_labels,
+        loc='upper center',
+        cellLoc='center',
+        colWidths=[0.07] + [0.06]*13
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.scale(1, 1.5)
 
+    plt.tight_layout()
     if pdf:
         pdf.savefig(fig)
     if PLOT:
         plt.show()
     plt.close(fig)
+
+# -----------------------------------------------------------------------------
+# TRANSITION MATRIX PAGE WITH FORECASTS & LOOK-BACKS (SECOND PAGE IN PDF)
+# -----------------------------------------------------------------------------
+
+def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
+    """Second PDF page: current state, forecasts, look-backs, and centered transition heatmap with axis labels."""
+    regimes = REGIME_ORDER
+    n = len(regimes)
+
+    # Empirical transition matrix
+    trans_counts = np.zeros((n, n))
+    prev = df['regime'].iloc[0]
+    for curr in df['regime'].iloc[1:]:
+        i, j = regimes.index(prev), regimes.index(curr)
+        trans_counts[i, j] += 1
+        prev = curr
+    trans_prob = trans_counts / trans_counts.sum(axis=1, keepdims=True)
+
+    # Identify current state
+    current_state = df['regime'].iloc[-1]
+
+    # Last posterior probabilities
+    last_probs = np.array([df[f'prob_{r}'].iloc[-1] for r in regimes])
+
+    forecast_steps = [1, 5, 20, 50]
+    lookback_days = [1, 5, 20, 50]
+    txt_lines = []
+
+    # Current state line
+    txt_lines.append(f"Current state → {current_state}")
+    txt_lines.append("")
+
+    # Forward multi-step forecasts
+    for k in forecast_steps:
+        tp_k = np.linalg.matrix_power(trans_prob, k) if k > 1 else trans_prob
+        probs_k = last_probs @ tp_k
+        mode_k = regimes[int(np.argmax(probs_k))]
+        txt_lines.append(
+            f"{k}-step forecast → {mode_k} | " + 
+            ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, probs_k)])
+        )
+    txt_lines.append("")
+
+    # 1-step forecasts from past days
+    for d in lookback_days:
+        if d <= len(df):
+            posterior_d = np.array([df[f'prob_{r}'].iloc[-d] for r in regimes])
+            f1 = posterior_d @ trans_prob
+            mode1 = regimes[int(np.argmax(f1))]
+            txt_lines.append(
+                f"1-step forecast from {d}-day ago → {mode1} | " + 
+                ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, f1)])
+            )
+    txt_lines.append("")
+
+    # 20-step forecasts from past days
+    for d in lookback_days:
+        if d <= len(df):
+            posterior_d = np.array([df[f'prob_{r}'].iloc[-d] for r in regimes])
+            f20 = posterior_d @ np.linalg.matrix_power(trans_prob, 20)
+            mode20 = regimes[int(np.argmax(f20))]
+            txt_lines.append(
+                f"20-step forecast from {d}-day ago → {mode20} | " + 
+                ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, f20)])
+            )
     
+    # Join lines into text block
+    text_block = "\n".join(txt_lines)
+
+    # Plot text and heatmap
+    fig, (ax_txt, ax_hm) = plt.subplots(
+        2, 1,
+        figsize=(11, 8.5),
+        gridspec_kw={'height_ratios': [0.4, 0.6]}
+    )
+    # Text panel
+    ax_txt.axis('off')
+    ax_txt.text(
+        0.5, 0.5,
+        text_block,
+        ha='center', va='center',
+        fontsize=10,
+        family='monospace'
+    )
+
+    # Heatmap panel (centered)
+    im = ax_hm.imshow(trans_prob, cmap='Blues', vmin=0, vmax=1)
+    ax_hm.set_anchor('C')
+    ax_hm.set_aspect('equal')
+    ax_hm.set_xticks(range(n), regimes, rotation=45, ha='center')
+    ax_hm.set_yticks(range(n), regimes, va='center')
+    ax_hm.set_xlabel('Ending State', labelpad=10, fontsize=12)
+    ax_hm.set_ylabel('Starting State', labelpad=10, fontsize=12)
+    ax_hm.set_title('Empirical Transition Probabilities', fontsize=14)
+    for i in range(n):
+        for j in range(n):
+            ax_hm.text(j, i, f"{trans_prob[i, j]:.2f}", ha='center', va='center')
+    fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    if pdf: pdf.savefig(fig)
+    if PLOT: plt.show()
+    plt.close(fig)
+
+
 # -------------------------------------------------------------
 if __name__ == "__main__":
     df = classify_risk_regimes()
