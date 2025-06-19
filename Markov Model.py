@@ -1,51 +1,16 @@
-# risk_regime_hmm.py
-# -------------------------------------------------------------
-# Detects market regimes for a stock using a Hidden Markov Model
-# with customizable number of states and extreme regime quantiles,
-# and tracks posterior probabilities over time.
-# -------------------------------------------------------------
+# risk_regime_hmm.py (formerly "Markov Model.py")
+# -----------------------------------------------------------------------------
+# Detects market regimes for a stock using a Hidden Markov Model (HMM).
+# Adds a **fifth** optional "neutral" regime that captures the central
+# x percent of the return‑mean distribution (default 50 %).  Setting
+# `NEUTRAL_PCT = 0.0` fully disables the neutral regime and restores the
+# original four‑state behaviour.
+# -----------------------------------------------------------------------------
 
-# === USER CONFIGURATION ===
-TICKER           = "VSTS"           # Yahoo Finance ticker
-START_DATE       = "2000-01-01"     # Analysis start date (YYYY-MM-DD)
-END_DATE         = None              # End date (YYYY-MM-DD) or None for today
-PLOT             = False              # Show exploratory plots
-SAVE_PDF         = True              # Save all plots to PDF
-PDF_PATH         = f"{TICKER}_risk_regimes.pdf"  # Output PDF file
-
-# Number of HMM regimes and quantile thresholds
-N_STATES         = 4                 # Number of hidden regimes
-SEED             = 42                # RNG seed for reproducibility
-
-# Quantile thresholds for defining extreme regimes (0 < q < 1)
-EXTREME_BEAR_Q   = 0.1              # <=10th percentile => extreme_bear
-EXTREME_BULL_Q   = 0.9              # >=90th percentile => extreme_bull
-
-# Feature windows / toggles
-VOL_Z_WINDOW     = 30                # Days for volume z-score
-VOL_WINDOW       = 20                # Days for realized volatility (rolling stdev)
-USE_VIX          = True              # Include ^VIX daily return
-VIX_TICKER       = "^VIX"           # External volatility index ticker
-USE_SPREAD       = True              # Include bid-ask spread proxy
-SPREAD_METHOD    = "high_low"       # Only (High-Low)/Close currently
-USE_SENTIMENT    = False             # Include sentiment score feature
-SENTIMENT_PATH   = "sentiment.csv"  # CSV w/ Date, sentiment columns
-
-# The exact order you want the regimes to appear
-REGIME_ORDER = ['extreme_bull', 'bull', 'bear', 'extreme_bear']
-
-# A matching color for each regime:
-COLOR_MAP = {
-    'extreme_bull':  '#008000',  
-    'bull':          '#ACF3AE',  
-    'bear':          '#FA6B84',  
-    'extreme_bear':  '#990000',  
-}
-
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Dependencies: pip install yfinance hmmlearn pandas numpy matplotlib
-# If USE_SENTIMENT == True: pip install vaderSentiment
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
+import os
 import itertools
 import numpy as np
 import pandas as pd
@@ -54,98 +19,206 @@ from hmmlearn.hmm import GaussianHMM
 from scipy.stats import skew, kurtosis
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from datetime import datetime
 
-# -------------------------------------------------------------
+# === USER CONFIGURATION =======================================================
+TICKER            = "SPY"           # Yahoo Finance ticker
+START_DATE        = "2000-01-01"    # Analysis start date (YYYY-MM-DD)
+END_DATE          = None              # End date (YYYY-MM-DD) or None for today
+PLOT              = False             # Show exploratory plots               
+SAVE_PDF          = True              # Save all plots to PDF
+REPORT_DIR = "Reports"
+os.makedirs(REPORT_DIR, exist_ok=True)
+today     = datetime.now().strftime("%Y-%m-%d")
+PDF_PATH  = os.path.join(REPORT_DIR,f"{TICKER}_risk_regimes_{today}.pdf")
+
+# -----------------------------------------------------------------------------
+# Regime configuration
+# -----------------------------------------------------------------------------
+N_STATES          = 5                 # Total HMM states (set to 5 to use neutral)
+SEED              = 42                # RNG seed for reproducibility
+
+# Quantile thresholds for *extreme* regimes (0 < q < 1)
+EXTREME_BEAR_Q    = 0.05              # <= 10th percentile ⇒ extreme_bear
+EXTREME_BULL_Q    = 0.95              # >= 90th percentile ⇒ extreme_bull
+
+# Width of the neutral band expressed as a proportion of the distribution.
+# 0.50 → central 50 % (25th–75th percentile).
+# 0.00 → neutral regime disabled (original 4‑regime model).
+NEUTRAL_PCT       = 0.250              # 0 ≤ x ≤ 1
+
+# -----------------------------------------------------------------------------
+# Feature windows / toggles
+# -----------------------------------------------------------------------------
+VOL_Z_WINDOW      = 30                # Days for volume z‑score
+VOL_WINDOW        = 20                # Days for realised volatility
+USE_VIX           = True              # Include ^VIX daily return
+VIX_TICKER        = "^VIX"           # External volatility index ticker
+USE_SPREAD        = True              # Include bid‑ask spread proxy
+SPREAD_METHOD     = "high_low"       # Only (High‑Low)/Close currently
+USE_SENTIMENT     = False             # Include sentiment score feature
+SENTIMENT_PATH    = "sentiment.csv"  # CSV with Date,sentiment columns
+
+# -----------------------------------------------------------------------------
+# Display order & colours
+# -----------------------------------------------------------------------------
+REGIME_ORDER = [
+    "extreme_bull",
+    "bull",
+    "neutral",   # central band (optionally disabled)
+    "bear",
+    "extreme_bear",
+]
+
+COLOR_MAP = {
+    "extreme_bull":  "#008000",
+    "bull":          "#ACF3AE",
+    "neutral":       "#C0C0C0",
+    "bear":          "#FA6B84",
+    "extreme_bear":  "#990000",
+}
+
+# -----------------------------------------------------------------------------
 # 1. Data download helper
-# -------------------------------------------------------------
-def _download_yf(ticker: str, start: str, end: str = None) -> pd.DataFrame:
+# -----------------------------------------------------------------------------
+
+def _download_yf(ticker: str, start: str, end: str | None = None) -> pd.DataFrame:
     df = yf.download(ticker, start=start, end=end)
     if df.empty:
         raise ValueError(f"No data found for {ticker} between {start} and {end}.")
     return df
 
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 2. Feature engineering
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
 def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    """Create return, volume and optional features."""
     feat_df = pd.DataFrame(index=df.index)
     feat_df["log_ret"] = np.log(df["Close"]).diff()
+
+    # volume z‑score
     vol_mu = df["Volume"].rolling(VOL_Z_WINDOW).mean()
     vol_sd = df["Volume"].rolling(VOL_Z_WINDOW).std()
     feat_df["vol_z"] = (df["Volume"] - vol_mu) / vol_sd
+
+    # realised volatility (annualised)
     feat_df["real_vol"] = feat_df["log_ret"].rolling(VOL_WINDOW).std() * np.sqrt(252)
+
+    # high‑low spread proxy
     if USE_SPREAD and SPREAD_METHOD == "high_low":
         feat_df["spread"] = (df["High"] - df["Low"]) / df["Close"]
+
+    # VIX daily return
     if USE_VIX:
         vdf = _download_yf(VIX_TICKER, START_DATE, END_DATE)
         feat_df["vix_ret"] = np.log(vdf["Close"]).diff().reindex(df.index)
+
+    # optional sentiment
     if USE_SENTIMENT:
         sent = pd.read_csv(SENTIMENT_PATH, parse_dates=["Date"], index_col="Date")
         sent = sent.reindex(df.index).ffill()
         for col in sent.columns:
             feat_df[col] = sent[col]
+
     return feat_df.dropna()
 
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 3. HMM helpers
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
 def _fit_hmm(X: np.ndarray, k: int, seed: int) -> GaussianHMM:
-    model = GaussianHMM(n_components=k, covariance_type="full", n_iter=1000, random_state=seed)
+    model = GaussianHMM(
+        n_components=k,
+        covariance_type="full",
+        n_iter=1000,
+        random_state=seed,
+    )
     model.fit(X)
     return model
 
-# 3b. State-to-Regime Mapping with Quantile Thresholds
-# -------------------------------------------------------------
-def _map_states_to_regimes(hmm: GaussianHMM) -> dict:
+# -----------------------------------------------------------------------------
+# 3b. State‑to‑Regime mapping with neutral support
+# -----------------------------------------------------------------------------
+
+def _map_states_to_regimes(hmm: GaussianHMM) -> dict[int, str]:
+    """Map each latent HMM state to a human‑readable regime label.
+
+    The mapping is based on the *mean* of the first feature (log‑return)
+    for each state and quantile thresholds defined above.
+
+    When `NEUTRAL_PCT > 0` **and** `N_STATES >= 5`, a central neutral band
+    of width `NEUTRAL_PCT` is carved out around the median.
+    """
     mu = hmm.means_[:, 0]
-    q_low = np.quantile(mu, EXTREME_BEAR_Q)
-    q_high = np.quantile(mu, EXTREME_BULL_Q)
-    mapping = {}
+
+    # extreme quantiles
+    q_low_ext  = np.quantile(mu, EXTREME_BEAR_Q)
+    q_high_ext = np.quantile(mu, EXTREME_BULL_Q)
+
+    # central (neutral) band
+    use_neutral = NEUTRAL_PCT > 0 and N_STATES >= 5
+    if use_neutral:
+        half_band = NEUTRAL_PCT / 2.0
+        q_neu_low  = np.quantile(mu, 0.5 - half_band)
+        q_neu_high = np.quantile(mu, 0.5 + half_band)
+    else:
+        q_neu_low = q_neu_high = None
+
+    median_mu = np.median(mu)
+
+    mapping: dict[int, str] = {}
     for state, m in enumerate(mu):
-        if m <= q_low:
-            label = 'extreme_bear'
-        elif m >= q_high:
-            label = 'extreme_bull'
+        if m <= q_low_ext:
+            label = "extreme_bear"
+        elif m >= q_high_ext:
+            label = "extreme_bull"
         else:
-            if N_STATES == 2:
-                label = 'bull'
-            elif N_STATES == 3:
-                label = 'neutral'
+            if use_neutral and q_neu_low <= m <= q_neu_high:
+                label = "neutral"
             else:
-                median = np.median(mu)
-                label = 'bear' if m < median else 'bull'
+                label = "bear" if m < median_mu else "bull"
         mapping[state] = label
     return mapping
 
-# -------------------------------------------------------------
-# 4. Classification pipeline (with posterior probabilities)
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 4. Classification pipeline (returns DataFrame with posterior probabilities)
+# -----------------------------------------------------------------------------
+
 def classify_risk_regimes() -> pd.DataFrame:
-    raw = _download_yf(TICKER, START_DATE, END_DATE)
-    feat_df = _feature_engineering(raw)
-    X = feat_df.values
+    """Complete workflow: download → feature engineering → HMM → mapping."""
+    raw      = _download_yf(TICKER, START_DATE, END_DATE)
+    feat_df  = _feature_engineering(raw)
+    X        = feat_df.values
 
-    # fit HMM and compute posteriors
-    model = _fit_hmm(X, N_STATES, SEED)
-    posteriors = model.predict_proba(X)  # shape (n_samples, n_states)
+    # fit HMM and compute posteriors (gamma probabilities)
+    model       = _fit_hmm(X, N_STATES, SEED)
+    posteriors  = model.predict_proba(X)            # shape (n_samples, n_states)
 
-    # map states to regimes
-    mapping = _map_states_to_regimes(model)
-    state_seq = model.predict(X)
-    regimes = np.vectorize(mapping.get)(state_seq)
+    # map states to labels & derive most probable path
+    mapping     = _map_states_to_regimes(model)
+    state_seq   = model.predict(X)
+    regimes     = np.vectorize(mapping.get)(state_seq)
 
-    # assemble output DataFrame
+    # assemble output
     out = raw.loc[feat_df.index].copy()
     out[feat_df.columns] = feat_df
-    out['regime'] = regimes
-    out['regime_num'] = pd.Categorical(regimes, categories=sorted(set(mapping.values())), ordered=True).codes
+    out["regime"]      = regimes
+    out["regime_num"]  = pd.Categorical(regimes, categories=list(dict.fromkeys(REGIME_ORDER)), ordered=True).codes
 
-    # add posterior probability columns per state label
+    # probability columns present in mapping
     for state, label in mapping.items():
-        out[f'prob_{label}'] = posteriors[:, state]
+        out[f"prob_{label}"] = posteriors[:, state]
 
-        # plotting & PDF
-    # Save plots to PDF if requested
+    # ensure *all* regimes in REGIME_ORDER have a probability column
+    for regime in REGIME_ORDER:
+        col = f"prob_{regime}"
+        if col not in out:
+            out[col] = 0.0
+
+    # ---------------------------------------------------------------------
+    # Plotting & PDF export
+    # ---------------------------------------------------------------------
     if SAVE_PDF:
         with PdfPages(PDF_PATH) as pdf:
             _plot_summary_stats(out, pdf)
@@ -154,7 +227,7 @@ def classify_risk_regimes() -> pd.DataFrame:
             _plot_posteriors(out, pdf)
             _plot_return_hist(out, pdf)
             _plot_scatter_feats(out, feat_df.columns, pdf)
-    # Show plots interactively if requested
+
     if PLOT:
         _plot_summary_stats(out)
         _plot_transition_matrix(out)
@@ -162,70 +235,61 @@ def classify_risk_regimes() -> pd.DataFrame:
         _plot_posteriors(out)
         _plot_return_hist(out)
         _plot_scatter_feats(out, feat_df.columns)
+
     return out
 
-# -------------------------------------------------------------
-# 5. Plotting helpers (with PDF saving)
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 5. Plotting helpers (all respect optional neutral regime)
+# -----------------------------------------------------------------------------
 
-def _plot_price_shade(df: pd.DataFrame, pdf: PdfPages = None):
-    """Price chart with regime shading."""
+def _plot_price_shade(df: pd.DataFrame, pdf: PdfPages | None = None):
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(df.index, df['Close'], label='Close')
+    ax.plot(df.index, df["Close"], label="Close")
     for regime in REGIME_ORDER:
-        mask = (df['regime'] == regime)
-        if not mask.any(): 
+        mask = df["regime"] == regime
+        if not mask.any():
             continue
-        ax.fill_between(df.index,
-                        df['Close'].min(), df['Close'].max(),
-                        where=mask,
-                        color=COLOR_MAP[regime],
-                        alpha=0.2,
-                        label=regime)
+        ax.fill_between(
+            df.index,
+            df["Close"].min(),
+            df["Close"].max(),
+            where=mask,
+            color=COLOR_MAP[regime],
+            alpha=0.2,
+            label=regime,
+        )
     ax.set_title(f"{TICKER}: Price with Regime Shading")
     ax.legend()
-    if pdf: pdf.savefig(fig)
-    if PLOT: plt.show()
-    plt.close(fig)
-
-def _plot_return_hist(df: pd.DataFrame, pdf: PdfPages = None):
-    # 1) create fig + ax
-    fig, ax = plt.subplots(figsize=(12, 5))
-
-    # 2) loop in fixed order and use same colors
-    for regime in REGIME_ORDER:
-        data = df.loc[df['regime'] == regime, 'log_ret']
-        if data.empty:
-            continue
-        ax.hist(
-            data,
-            bins=50,
-            alpha=0.6,
-            label=regime,
-            color=COLOR_MAP[regime],
-        )
-
-    # 3) decorate
-    ax.set_title(f"{TICKER}: Log-Return Distribution by Regime")
-    ax.set_xlabel("Log Return")
-    ax.set_ylabel("Frequency")
-    ax.legend(loc="upper right")
-
-    # 4) save/show/close
     if pdf:
         pdf.savefig(fig)
     if PLOT:
         plt.show()
     plt.close(fig)
 
-def _plot_scatter_feats(df: pd.DataFrame, feat_cols: list, pdf: PdfPages = None):
-    """Pairwise scatter plots of features by regime."""
+
+def _plot_return_hist(df: pd.DataFrame, pdf: PdfPages | None = None):
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for regime in REGIME_ORDER:
+        data = df.loc[df["regime"] == regime, "log_ret"]
+        if data.empty:
+            continue
+        ax.hist(data, bins=50, alpha=0.6, label=regime, color=COLOR_MAP[regime])
+    ax.set_title(f"{TICKER}: Log‑Return Distribution by Regime")
+    ax.set_xlabel("Log Return")
+    ax.set_ylabel("Frequency")
+    ax.legend(loc="upper right")
+    if pdf:
+        pdf.savefig(fig)
+    if PLOT:
+        plt.show()
+    plt.close(fig)
+
+
+def _plot_scatter_feats(df: pd.DataFrame, feat_cols: list[str], pdf: PdfPages | None = None):
     for x, y in itertools.combinations(feat_cols, 2):
         fig, ax = plt.subplots(figsize=(6, 4))
-
-        # plot *all* regimes on this same fig
         for regime in REGIME_ORDER:
-            mask = (df['regime'] == regime)
+            mask = df["regime"] == regime
             if not mask.any():
                 continue
             ax.scatter(
@@ -233,55 +297,48 @@ def _plot_scatter_feats(df: pd.DataFrame, feat_cols: list, pdf: PdfPages = None)
                 df.loc[mask, y],
                 alpha=0.6,
                 label=regime,
-                color=COLOR_MAP[regime]
+                color=COLOR_MAP[regime],
             )
-
         ax.set_xlabel(x)
         ax.set_ylabel(y)
         ax.set_title(f"{x} vs {y}")
         ax.legend()
         plt.tight_layout()
-
         if pdf:
             pdf.savefig(fig)
         if PLOT:
             plt.show()
         plt.close(fig)
 
-def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages = None):
+
+def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages | None = None):
+    # Use only regimes for which probability columns exist
+    regimes_present = [r for r in REGIME_ORDER if f"prob_{r}" in df]
+    prob_vals       = [df[f"prob_{r}"] for r in regimes_present]
+    colors          = [COLOR_MAP[r]     for r in regimes_present]
+
     fig, ax = plt.subplots(figsize=(12, 5))
-    dates = df.index
-
-    # Build list of arrays in REGIME_ORDER
-    prob_vals = [df[f'prob_{r}'] for r in REGIME_ORDER]
-    colors   = [COLOR_MAP[r]        for r in REGIME_ORDER]
-
-    ax.stackplot(dates,
-                 *prob_vals,
-                 labels=REGIME_ORDER,
-                 colors=colors,
-                 alpha=0.6)
+    ax.stackplot(df.index, *prob_vals, labels=regimes_present, colors=colors, alpha=0.6)
     ax.set_title(f"{TICKER}: State Posterior Probabilities")
-    ax.legend(loc='upper left')
-    ax.set_ylabel('Probability')
-    if pdf: pdf.savefig(fig)
-    if PLOT: plt.show()
+    ax.set_ylabel("Probability")
+    ax.legend(loc="upper left")
+    if pdf:
+        pdf.savefig(fig)
+    if PLOT:
+        plt.show()
     plt.close(fig)
 
 # -----------------------------------------------------------------------------
-# SUMMARY-PAGE PLOTTER (FIRST PAGE IN PDF)
+# SUMMARY‑PAGE PLOTTER (FIRST PAGE IN PDF)
 # -----------------------------------------------------------------------------
 
 def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
-    """First PDF page: key regime diagnostics (table only)."""
-    # Compute regime-level statistics
     results = []
     for regime in REGIME_ORDER:
-        mask = df['regime'] == regime
+        mask = df["regime"] == regime
         if not mask.any():
             continue
-        # choose return column
-        ret_col = 'ret' if 'ret' in df.columns else 'log_ret'
+        ret_col = "ret" if "ret" in df.columns else "log_ret"
         rets = df.loc[mask, ret_col]
         count = mask.sum()
         mean_ret = rets.mean()
@@ -296,12 +353,12 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
         kt = kurtosis(rets)
         z_95 = 1.64485
         var95 = -(mean_ret + z_95 * rets.std())
-        es95 = -mean_ret + rets.std() * (np.exp(-z_95**2/2)/(np.sqrt(2*np.pi)*(1-0.95)))
-        post_col = df.get(f'prob_{regime}', pd.Series(index=df.index, data=np.nan))
+        es95 = -mean_ret + rets.std() * (np.exp(-z_95**2 / 2) / (np.sqrt(2 * np.pi) * (1 - 0.95)))
+        post_col = df[f"prob_{regime}"] if f"prob_{regime}" in df else pd.Series(index=df.index, data=np.nan)
         avg_post = post_col.mean()
         last_post = post_col.iloc[-1] if not post_col.empty else np.nan
-        transitions = df['regime'].shift().fillna(regime).astype(str) + '_' + df['regime'].astype(str)
-        n_starts = (transitions == f'{regime}_{regime}').sum()
+        transitions = df["regime"].shift().fillna(regime).astype(str) + "_" + df["regime"].astype(str)
+        n_starts = (transitions == f"{regime}_{regime}").sum()
         exp_dur = count / max(n_starts, 1)
         results.append([
             regime,
@@ -317,27 +374,47 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
             round(es95, 4),
             round(avg_post, 3),
             round(last_post, 3),
-            round(exp_dur, 1)
+            round(exp_dur, 1),
         ])
+
     col_labels = [
-        'Regime', 'Count', 'Mean', 'Ann σ', 'Sharpe', 'Sortino', 'MaxDD',
-        'Skew', 'Kurt', 'VaR95', 'ES95', 'Avg Post', 'Last Post', 'Exp Dur'
+        "Regime",
+        "Count",
+        "Mean",
+        "Ann σ",
+        "Sharpe",
+        "Sortino",
+        "MaxDD",
+        "Skew",
+        "Kurt",
+        "VaR95",
+        "ES95",
+        "Avg Post",
+        "Last Post",
+        "Exp Dur",
     ]
 
-    # Build table figure
     fig, ax = plt.subplots(figsize=(11, 8.5))
-    ax.axis('off')
+    # Add a big page title
+    date_end = END_DATE if END_DATE else pd.Timestamp.today().strftime("%Y-%m-%d")
+    fig.suptitle(
+        f"{TICKER} Risk Regime Analysis  ({START_DATE} → {date_end})",
+        fontsize=18,
+        fontweight="bold",
+        y=0.98
+    )
+    ax.axis("off")
+    
     tbl = ax.table(
         cellText=results,
         colLabels=col_labels,
-        loc='upper center',
-        cellLoc='center',
-        colWidths=[0.07] + [0.06]*13
+        loc="upper center",
+        cellLoc="center",
+        colWidths=[0.07] + [0.06] * 13,
     )
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(8)
     tbl.scale(1, 1.5)
-
     plt.tight_layout()
     if pdf:
         pdf.savefig(fig)
@@ -346,38 +423,39 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
     plt.close(fig)
 
 # -----------------------------------------------------------------------------
-# TRANSITION MATRIX PAGE WITH FORECASTS & LOOK-BACKS (SECOND PAGE IN PDF)
+# TRANSITION MATRIX PAGE (SECOND PAGE IN PDF)
 # -----------------------------------------------------------------------------
 
 def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
-    """Second PDF page: current state, forecasts, look-backs, and centered transition heatmap with axis labels."""
-    regimes = REGIME_ORDER
+    regimes = [r for r in REGIME_ORDER if r in df["regime"].unique()]
     n = len(regimes)
 
-    # Empirical transition matrix
+    # empirical transition counts & probabilities
     trans_counts = np.zeros((n, n))
-    prev = df['regime'].iloc[0]
-    for curr in df['regime'].iloc[1:]:
+    prev = df["regime"].iloc[0]
+    for curr in df["regime"].iloc[1:]:
+        if prev not in regimes or curr not in regimes:
+            prev = curr
+            continue
         i, j = regimes.index(prev), regimes.index(curr)
         trans_counts[i, j] += 1
         prev = curr
-    trans_prob = trans_counts / trans_counts.sum(axis=1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        trans_prob = np.nan_to_num(trans_counts / trans_counts.sum(axis=1, keepdims=True))
 
-    # Identify current state
-    current_state = df['regime'].iloc[-1]
-
-    # Last posterior probabilities
-    last_probs = np.array([df[f'prob_{r}'].iloc[-1] for r in regimes])
+    # current state & last posteriors
+    current_state = df["regime"].iloc[-1]
+    last_probs = np.array([df[f"prob_{r}"].iloc[-1] for r in regimes])
 
     forecast_steps = [1, 5, 20, 50]
-    lookback_days = [1, 5, 20, 50]
-    txt_lines = []
+    lookback_days  = [1, 5, 20, 50]
+    txt_lines: list[str] = []
 
-    # Current state line
+    # current state
     txt_lines.append(f"Current state → {current_state}")
     txt_lines.append("")
 
-    # Forward multi-step forecasts
+    # forward forecasts
     for k in forecast_steps:
         tp_k = np.linalg.matrix_power(trans_prob, k) if k > 1 else trans_prob
         probs_k = last_probs @ tp_k
@@ -388,71 +466,62 @@ def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
         )
     txt_lines.append("")
 
-    # 1-step forecasts from past days
+    # backward‑looking one‑step forecasts
     for d in lookback_days:
         if d <= len(df):
-            posterior_d = np.array([df[f'prob_{r}'].iloc[-d] for r in regimes])
+            posterior_d = np.array([df[f"prob_{r}"].iloc[-d] for r in regimes])
             f1 = posterior_d @ trans_prob
             mode1 = regimes[int(np.argmax(f1))]
             txt_lines.append(
-                f"1-step forecast from {d}-day ago → {mode1} | " + 
+                f"1‑step forecast from {d}-day ago → {mode1} | " + 
                 ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, f1)])
             )
     txt_lines.append("")
 
-    # 20-step forecasts from past days
+    # 20‑step forecasts from past days
     for d in lookback_days:
         if d <= len(df):
-            posterior_d = np.array([df[f'prob_{r}'].iloc[-d] for r in regimes])
+            posterior_d = np.array([df[f"prob_{r}"].iloc[-d] for r in regimes])
             f20 = posterior_d @ np.linalg.matrix_power(trans_prob, 20)
             mode20 = regimes[int(np.argmax(f20))]
             txt_lines.append(
-                f"20-step forecast from {d}-day ago → {mode20} | " + 
+                f"20‑step forecast from {d}-day ago → {mode20} | " + 
                 ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, f20)])
             )
-    
-    # Join lines into text block
+
     text_block = "\n".join(txt_lines)
 
-    # Plot text and heatmap
-    fig, (ax_txt, ax_hm) = plt.subplots(
-        2, 1,
-        figsize=(11, 8.5),
-        gridspec_kw={'height_ratios': [0.4, 0.6]}
-    )
-    # Text panel
-    ax_txt.axis('off')
-    ax_txt.text(
-        0.5, 0.5,
-        text_block,
-        ha='center', va='center',
-        fontsize=10,
-        family='monospace'
-    )
+    fig, (ax_txt, ax_hm) = plt.subplots(2, 1, figsize=(11, 8.5), gridspec_kw={"height_ratios": [0.4, 0.6]})
 
-    # Heatmap panel (centered)
-    im = ax_hm.imshow(trans_prob, cmap='Blues', vmin=0, vmax=1)
-    ax_hm.set_anchor('C')
-    ax_hm.set_aspect('equal')
-    ax_hm.set_xticks(range(n), regimes, rotation=45, ha='center')
-    ax_hm.set_yticks(range(n), regimes, va='center')
-    ax_hm.set_xlabel('Ending State', labelpad=10, fontsize=12)
-    ax_hm.set_ylabel('Starting State', labelpad=10, fontsize=12)
-    ax_hm.set_title('Empirical Transition Probabilities', fontsize=14)
+    # text panel
+    ax_txt.axis("off")
+    ax_txt.text(0.5, 0.5, text_block, ha="center", va="center", fontsize=10, family="monospace")
+
+    # heatmap
+    im = ax_hm.imshow(trans_prob, cmap="Blues", vmin=0, vmax=1)
+    ax_hm.set_anchor("C")
+    ax_hm.set_aspect("equal")
+    ax_hm.set_xticks(range(n), regimes, rotation=45, ha="center")
+    ax_hm.set_yticks(range(n), regimes, va="center")
+    ax_hm.set_xlabel("Ending State", labelpad=10, fontsize=12)
+    ax_hm.set_ylabel("Starting State", labelpad=10, fontsize=12)
+    ax_hm.set_title("Empirical Transition Probabilities", fontsize=14)
     for i in range(n):
         for j in range(n):
-            ax_hm.text(j, i, f"{trans_prob[i, j]:.2f}", ha='center', va='center')
+            ax_hm.text(j, i, f"{trans_prob[i, j]:.2f}", ha="center", va="center")
     fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
 
     plt.tight_layout()
-    if pdf: pdf.savefig(fig)
-    if PLOT: plt.show()
+    if pdf:
+        pdf.savefig(fig)
+    if PLOT:
+        plt.show()
     plt.close(fig)
 
-
-# -------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Script entry‑point
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     df = classify_risk_regimes()
-    # Safely gather probability columns (ensure string names)
-    prob_cols = [c for c in df.columns if isinstance(c, str) and c.startswith('prob_')]
-    print(df.tail()[['Close', 'regime'] + prob_cols])
+    prob_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("prob_")]
+    print(df.tail()[["Close", "regime"] + prob_cols])
