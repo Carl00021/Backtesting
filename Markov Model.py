@@ -6,7 +6,7 @@
 # -------------------------------------------------------------
 
 # === USER CONFIGURATION ===
-TICKER           = "SPY"           # Yahoo Finance ticker
+TICKER           = "QQQ"           # Yahoo Finance ticker
 START_DATE       = "2000-01-01"     # Analysis start date (YYYY-MM-DD)
 END_DATE         = None              # End date (YYYY-MM-DD) or None for today
 PLOT             = False              # Show exploratory plots
@@ -18,9 +18,8 @@ N_STATES         = 4                 # Number of hidden regimes
 SEED             = 42                # RNG seed for reproducibility
 
 # Quantile thresholds for defining extreme regimes (0 < q < 1)
-EXTREME_BEAR_Q   = 0.05              # <=10th percentile => extreme_bear
-EXTREME_BULL_Q   = 0.95              # >=90th percentile => extreme_bull
-NEUTRAL_MASS     = 0.50              # e.g. 50% of the middle of the mu‐distribution
+EXTREME_BEAR_Q   = 0.1              # <=10th percentile => extreme_bear
+EXTREME_BULL_Q   = 0.9              # >=90th percentile => extreme_bull
 
 # Feature windows / toggles
 VOL_Z_WINDOW     = 30                # Days for volume z-score
@@ -38,8 +37,8 @@ REGIME_ORDER = ['extreme_bull', 'bull', 'bear', 'extreme_bear']
 # A matching color for each regime:
 COLOR_MAP = {
     'extreme_bull':  '#008000',  
-    'bull':          '#00b300',  
-    'bear':          '#ff3333',  
+    'bull':          '#ACF3AE',  
+    'bear':          '#FA6B84',  
     'extreme_bear':  '#990000',  
 }
 
@@ -148,14 +147,16 @@ def classify_risk_regimes() -> pd.DataFrame:
     # Save plots to PDF if requested
     if SAVE_PDF:
         with PdfPages(PDF_PATH) as pdf:
+            _plot_summary_stats(out, pdf)
             _plot_price_shade(out, pdf)
             _plot_posteriors(out, pdf)
             _plot_return_hist(out, pdf)
             _plot_scatter_feats(out, feat_df.columns, pdf)
     # Show plots interactively if requested
     if PLOT:
+        _plot_summary_stats(out)
         _plot_price_shade(out)
-        _plot_posteriors(out, pdf)
+        _plot_posteriors(out)
         _plot_return_hist(out)
         _plot_scatter_feats(out, feat_df.columns)
     return out
@@ -184,10 +185,9 @@ def _plot_price_shade(df: pd.DataFrame, pdf: PdfPages = None):
     if PLOT: plt.show()
     plt.close(fig)
 
-
 def _plot_return_hist(df: pd.DataFrame, pdf: PdfPages = None):
     # 1) create fig + ax
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(12, 5))
 
     # 2) loop in fixed order and use same colors
     for regime in REGIME_ORDER:
@@ -215,33 +215,38 @@ def _plot_return_hist(df: pd.DataFrame, pdf: PdfPages = None):
         plt.show()
     plt.close(fig)
 
-
-
 def _plot_scatter_feats(df: pd.DataFrame, feat_cols: list, pdf: PdfPages = None):
     """Pairwise scatter plots of features by regime."""
     for x, y in itertools.combinations(feat_cols, 2):
         fig, ax = plt.subplots(figsize=(6, 4))
-    for regime in REGIME_ORDER:
-        mask = (df['regime'] == regime)
-        if not mask.any():
-            continue
-        ax.scatter(df.loc[mask, x],
+
+        # plot *all* regimes on this same fig
+        for regime in REGIME_ORDER:
+            mask = (df['regime'] == regime)
+            if not mask.any():
+                continue
+            ax.scatter(
+                df.loc[mask, x],
                 df.loc[mask, y],
                 alpha=0.6,
                 label=regime,
-                color=COLOR_MAP[regime])
+                color=COLOR_MAP[regime]
+            )
+
         ax.set_xlabel(x)
         ax.set_ylabel(y)
         ax.set_title(f"{x} vs {y}")
         ax.legend()
         plt.tight_layout()
-        if pdf: pdf.savefig(fig)
-        if PLOT: plt.show()
+
+        if pdf:
+            pdf.savefig(fig)
+        if PLOT:
+            plt.show()
         plt.close(fig)
 
-
 def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages = None):
-    fig, ax = plt.subplots(figsize=(12, 4))
+    fig, ax = plt.subplots(figsize=(12, 5))
     dates = df.index
 
     # Build list of arrays in REGIME_ORDER
@@ -258,6 +263,39 @@ def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages = None):
     ax.set_ylabel('Probability')
     if pdf: pdf.savefig(fig)
     if PLOT: plt.show()
+    plt.close(fig)
+
+def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages = None):
+    """First PDF page: summary statistics including regime counts, average and last posterior probabilities."""
+    # Compute counts, average and last posterior probability per regime
+    stats = []
+    for regime in REGIME_ORDER:
+        count = (df['regime'] == regime).sum()
+        posterior_col = df.get(f'prob_{regime}', pd.Series())
+        avg_prob = posterior_col.mean() if not posterior_col.empty else 0
+        last_prob = posterior_col.iloc[-1] if not posterior_col.empty else 0
+        stats.append([regime, count, round(avg_prob, 3), round(last_prob, 3)])
+
+    # Create a table figure
+    fig, ax = plt.subplots(figsize=(6, 4))
+    col_labels = ['Regime', 'Count', 'Avg Posterior', 'Last Posterior']
+    table = ax.table(
+        cellText=stats,
+        colLabels=col_labels,
+        loc='center'
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2)
+
+    ax.axis('off')
+    ax.set_title('Summary Statistics by Regime')
+    plt.tight_layout()
+
+    if pdf:
+        pdf.savefig(fig)
+    if PLOT:
+        plt.show()
     plt.close(fig)
     
 # -------------------------------------------------------------
