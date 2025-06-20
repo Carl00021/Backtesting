@@ -2,8 +2,6 @@
 """
 Created on Fri Jul 12 09:56:48 2024
 
-@author: Heavens Base
-
 V1: Boxplot, Lineplot, Histogram for Price Change Filter.
 V2: Added backtest variable seperate from stock returns. You can now see stock return vs backtest   filter.
 V3: Added Line Chart

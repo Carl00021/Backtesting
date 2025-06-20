@@ -2,7 +2,6 @@
 """
 Created on Tue Jun  3 23:57:17 2025
 
-@author: 14165
 """
 
 import re
