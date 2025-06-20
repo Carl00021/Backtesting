@@ -1,5 +1,5 @@
 # Markov Model.py – sticky HMM with adaptive detection
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Detects market regimes via a Hidden Markov Model (HMM) with:
 #   • Sticky‑state persistence
 #   • Adaptive rolling refits + probability triggers
@@ -13,10 +13,11 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from hmmlearn.hmm import GaussianHMM, GMMHMM
+from hmmlearn.hmm import GaussianHMM, GMMHMM  # GMMHMM: Gaussian mixture HMM (for heavy tails)
 from scipy.stats import skew, kurtosis
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+import scipy.linalg as linalg
 
 # Avoid MKL+KMeans memory‑leak warning on Windows (harmless but noisy)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -30,11 +31,17 @@ SAVE_PDF            = True
 REPORT_DIR          = "Reports"
 
 # HMM / Regime ----------------------------------------------------------------
+# MODEL_TYPE selects emission model:
+#   • "GaussianHMM" → single Gaussian emission (default: simpler, faster)
+#   • "GMMHMM"     → Gaussian mixture emissions (better for fat-tailed regimes)
+MODEL_TYPE         = "GaussianHMM"   # choose between "GaussianHMM" or "GMMHMM"
+N_MIX              = 2                # number of mixtures for GMMHMM (ignored by GaussianHMM)
+
 N_STATES            = 5
 SEED                = 42
-STICKINESS          = 5.0             # Dirichlet prior boost on self‑transitions
+STICKINESS          = 5.0             # Dirichlet prior boost on self-transitions
 MIN_SELF_PROB       = 0.0             # 0 ⇒ off
-COVARIANCE_TYPE     = "diag"          # "diag" safe; switch to "full" if desired
+COVARIANCE_TYPE     = "full"          # "diag" safe; switch to "full" if desired
 MIN_COVAR           = 1e-3            # Regularisation for covariance matrices
 
 # Adaptive detection ----------------------------------------------------------
@@ -46,7 +53,7 @@ PROB_CONSEC_DAYS    = 2               # consecutive confirmations
 # Regime mapping --------------------------------------------------------------
 EXTREME_BEAR_Q      = 0.10
 EXTREME_BULL_Q      = 0.90
-NEUTRAL_PCT         = 0.40            # 0 ⇒ disable neutral regime
+NEUTRAL_PCT         = 0.35            # 0 ⇒ disable neutral regime
 
 REGIME_ORDER        = [
     "extreme_bull", "bull", "neutral", "bear", "extreme_bear"
@@ -73,16 +80,14 @@ PDF_PATH = os.path.join(
     f"{TICKER}_risk_regimes_{datetime.now().strftime('%Y-%m-%d')}.pdf",
 )
 
+# ----------------------------------------------------------------------------- 
+# Helpers
 # -----------------------------------------------------------------------------
-# Helpers                                                                       
-# -----------------------------------------------------------------------------
-
 def _download_yf(ticker: str, start: str, end: str | None = None) -> pd.DataFrame:
     df = yf.download(ticker, start=start, end=end)
     if df.empty:
         raise ValueError(f"No data for {ticker}.")
     return df
-
 
 def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
@@ -101,63 +106,156 @@ def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
         f = f.join(sent, how="left")
     return f.dropna()
 
+# ----------------------------------------------------------------------------- 
+# Model fitting & sanitisation ------------------------------------------------ 
 # -----------------------------------------------------------------------------
-# Model fitting & sanitisation ------------------------------------------------
-# -----------------------------------------------------------------------------
-
-def _sanitize_startprob(model: GaussianHMM):
+def _sanitize_startprob(model):
     sp = model.startprob_
     if (not np.isfinite(sp).all()) or sp.sum() == 0:
         model.startprob_ = np.full_like(sp, 1.0 / len(sp))
     else:
         model.startprob_ = sp / sp.sum()
 
-
-def _sanitize_transmat(model: GaussianHMM):
+def _sanitize_transmat(model):
     tm = model.transmat_.copy()
-    if not np.isfinite(tm).all():
-        tm[~np.isfinite(tm)] = 0.0
+    tm[~np.isfinite(tm)] = 0.0
     row_sums = tm.sum(axis=1, keepdims=True)
+    zero = row_sums.squeeze() == 0
+    tm[zero] = 1.0 / tm.shape[1]
+    model.transmat_ = tm / tm.sum(axis=1, keepdims=True)
+
+def _sanitize_gmm_weights(model):
+    if not hasattr(model, "weights_"):
+        return
+    w = model.weights_.copy()
+    w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+    w = np.maximum(w, 0.0)
+    row_sums = w.sum(axis=1, keepdims=True)
     zero_rows = row_sums.squeeze() == 0
-    tm[zero_rows] = 1.0 / tm.shape[1]
-    row_sums = tm.sum(axis=1, keepdims=True)
-    model.transmat_ = tm / row_sums
+    w[zero_rows] = 1.0 / w.shape[1]
+    model.weights_ = w / w.sum(axis=1, keepdims=True)
 
+def _sanitize_means(model):
+    if hasattr(model, "means_"):
+        model.means_ = np.nan_to_num(model.means_, nan=0.0, posinf=0.0, neginf=0.0)
 
-def _fit_hmm(X: np.ndarray, k: int, seed: int) -> GaussianHMM:
+def _sanitize_covars(model):
+    if not hasattr(model, "covars_"):
+        return
+    
+    MIN_COVAR = globals().get("MIN_COVAR", 1e-6)
+    
+    if model.covariance_type == "diag":
+        if isinstance(model, GMMHMM):
+            expected_shape = (model.n_components, model.n_mix, model.n_features)
+        else:
+            expected_shape = (model.n_components, model.n_features)
+        if model.covars_.shape != expected_shape:
+            print(f"Warning: covars_ shape {model.covars_.shape} does not match "
+                  f"expected {expected_shape}, reinitializing with MIN_COVAR")
+            model.covars_ = np.full(expected_shape, MIN_COVAR)
+        else:
+            model.covars_ = np.nan_to_num(model.covars_, nan=MIN_COVAR, posinf=MIN_COVAR, neginf=MIN_COVAR)
+            model.covars_ = np.maximum(model.covars_, MIN_COVAR)
+            if np.any(model.covars_ <= 0):
+                print("Warning: Some variances are non-positive, setting to MIN_COVAR")
+                model.covars_[model.covars_ <= 0] = MIN_COVAR
+    elif model.covariance_type == "full":
+        for i in range(model.n_components):
+            for j in range(model.n_mix if isinstance(model, GMMHMM) else 1):
+                cov = model.covars_[i, j].copy() if isinstance(model, GMMHMM) else model.covars_[i].copy()
+                if not np.all(np.isfinite(cov)):
+                    cov = np.eye(model.n_features) * MIN_COVAR
+                else:
+                    try:
+                        linalg.cholesky(cov)
+                    except linalg.LinAlgError:
+                        epsilon = MIN_COVAR
+                        while True:
+                            try:
+                                linalg.cholesky(cov + epsilon * np.eye(model.n_features))
+                                break
+                            except linalg.LinAlgError:
+                                epsilon *= 10
+                        cov += epsilon * np.eye(model.n_features)
+                if isinstance(model, GMMHMM):
+                    model.covars_[i, j] = cov
+                else:
+                    model.covars_[i] = cov
+
+def _fit_hmm(X: np.ndarray, k: int, seed: int):
+    mean = np.mean(X, axis=0)
+    std = np.std(X, axis=0)
+    std = np.maximum(std, 1e-8)
+    X_std = (X - mean) / std
+
     prior = np.full((k, k), 1.0)
     np.fill_diagonal(prior, STICKINESS)
 
-    model = GaussianHMM(
-        n_components=k,
-        covariance_type=COVARIANCE_TYPE,
-        n_iter=1000,
-        random_state=seed,
-        transmat_prior=prior,
-        startprob_prior=np.full(k, 1.0),
-        min_covar=MIN_COVAR,
-    )
-    model.fit(X)
+    def _make_model(reg_covar):
+        if MODEL_TYPE == "GaussianHMM":
+            return GaussianHMM(
+                n_components=k,
+                covariance_type=COVARIANCE_TYPE,
+                n_iter=1000,
+                random_state=seed,
+                transmat_prior=prior,
+                startprob_prior=np.full(k, 1.0),
+                min_covar=reg_covar,
+            )
+        elif MODEL_TYPE == "GMMHMM":
+            return GMMHMM(
+                n_components=k,
+                n_mix=N_MIX,
+                covariance_type=COVARIANCE_TYPE,
+                n_iter=1000,
+                random_state=seed,
+                transmat_prior=prior,
+                startprob_prior=np.full(k, 1.0),
+                min_covar=reg_covar,
+            )
+        else:
+            raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
+
+    reg = MIN_COVAR
+    for attempt in range(4):
+        model = _make_model(reg)
+        try:
+            model.fit(X_std)
+            break
+        except (ValueError, np.linalg.LinAlgError) as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            reg *= 10
+            if attempt == 3:
+                raise RuntimeError("HMM failed to converge after retries.") from e
 
     _sanitize_startprob(model)
     _sanitize_transmat(model)
+    if MODEL_TYPE == "GMMHMM":
+        _sanitize_gmm_weights(model)
+    _sanitize_means(model)
+    _sanitize_covars(model)
 
     if MIN_SELF_PROB > 0.0:
-        tm   = model.transmat_.copy()
+        tm = model.transmat_.copy()
         diag = np.diag(tm)
-        low  = diag < MIN_SELF_PROB
+        low = diag < MIN_SELF_PROB
         if low.any():
             tm[low] = tm[low] * (1.0 - MIN_SELF_PROB) / np.clip(1.0 - diag[low], 1e-9, None)
-            np.fill_diagonal(tm, np.maximum(np.diag(tm), MIN_SELF_PROB))
+            np.fill_diagonal(tm, np.maximum(diag, MIN_SELF_PROB))
             model.transmat_ = tm / tm.sum(axis=1, keepdims=True)
-    return model
+    return model, mean, std
 
+# ----------------------------------------------------------------------------- 
+# Regime mapping -------------------------------------------------------------- 
 # -----------------------------------------------------------------------------
-# Regime mapping --------------------------------------------------------------
-# -----------------------------------------------------------------------------
-
-def _map_states_to_regimes(hmm: GaussianHMM) -> dict[int, str]:
-    mu = hmm.means_[:, 0]
+def _map_states_to_regimes(hmm):
+    if hasattr(hmm, "weights_"):
+        mix_means = hmm.means_[:, :, 0]
+        weights = hmm.weights_
+        mu = np.sum(mix_means * weights, axis=1)
+    else:
+        mu = hmm.means_[:, 0]
     q_lo, q_hi = np.quantile(mu, EXTREME_BEAR_Q), np.quantile(mu, EXTREME_BULL_Q)
     use_neu = NEUTRAL_PCT > 0 and N_STATES >= 5
     if use_neu:
@@ -178,23 +276,38 @@ def _map_states_to_regimes(hmm: GaussianHMM) -> dict[int, str]:
                 mapping[s] = "bear" if m < med else "bull"
     return mapping
 
+# ----------------------------------------------------------------------------- 
+# Adaptive signal generation -------------------------------------------------- 
 # -----------------------------------------------------------------------------
-# Adaptive signal generation --------------------------------------------------
 def generate_adaptive_signals(feat: pd.DataFrame) -> pd.DataFrame:
     signals = []
-    consec  = 0
+    consec = 0
     last_lab = None
-    model: GaussianHMM | None = None
-    mapping: dict[int, str] | None = None
+    model = None
+    mean = None
+    std = None
 
     for i in range(ADAPTIVE_WINDOW, len(feat)):
         if model is None or (i - ADAPTIVE_WINDOW) % ADAPTIVE_FREQ == 0:
-            X_train = feat.iloc[i-ADAPTIVE_WINDOW:i].values
-            model   = _fit_hmm(X_train, N_STATES, SEED)
+            X_train = feat.iloc[i - ADAPTIVE_WINDOW:i].values
+            model, mean, std = _fit_hmm(X_train, N_STATES, SEED)
             mapping = _map_states_to_regimes(model)
 
-        x_new = feat.iloc[i].values.reshape(1, -1)
-        probs = model.predict_proba(x_new)[0]
+        x_new = feat.iloc[i].values
+        x_new_std = (x_new - mean) / std
+        x_new_std = x_new_std.reshape(1, -1)
+        for attempt in range(4):
+            try:
+                probs = model.predict_proba(x_new_std)[0]
+                break
+            except Exception as e:
+                print(f"Attempt {attempt + 1}: predict_proba failed with error: {e}")
+                globals()["MIN_COVAR"] *= 10
+                model, mean, std = _fit_hmm(feat.iloc[i - ADAPTIVE_WINDOW:i].values, N_STATES, SEED)
+                mapping = _map_states_to_regimes(model)
+        else:
+            raise RuntimeError("Failed to evaluate probability after retries.")
+
         top_i = int(np.argmax(probs))
         label = mapping[top_i]
 
@@ -213,28 +326,29 @@ def generate_adaptive_signals(feat: pd.DataFrame) -> pd.DataFrame:
 
     return pd.DataFrame(signals)
 
-# -----------------------------------------------------------------------------
-# Core pipeline ---------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
+# Core pipeline --------------------------------------------------------------- 
 # -----------------------------------------------------------------------------
 def classify_risk_regimes() -> pd.DataFrame:
-    raw  = _download_yf(TICKER, START_DATE, END_DATE)
+    raw = _download_yf(TICKER, START_DATE, END_DATE)
     feat = _feature_engineering(raw)
 
-    # --- Adaptive detection signals (Suggestion 3) -------------------------
+    # Adaptive detection signals
     signals_df = generate_adaptive_signals(feat)
     print("Adaptive detection signals:\n", signals_df)
 
-    X     = feat.values
-    model = _fit_hmm(X, N_STATES, SEED)
-    post  = model.predict_proba(X)
+    X = feat.values
+    model, mean, std = _fit_hmm(X, N_STATES, SEED)
+    X_std = (X - mean) / std
+    post = model.predict_proba(X_std)
 
     mapping = _map_states_to_regimes(model)
-    states  = model.predict(X)
+    states = model.predict(X_std)
     regimes = np.vectorize(mapping.get)(states)
 
     out = raw.loc[feat.index].copy()
     out[feat.columns] = feat
-    out["regime"]     = regimes
+    out["regime"] = regimes
     out["regime_num"] = pd.Categorical(
         regimes,
         categories=list(dict.fromkeys(REGIME_ORDER)),
@@ -244,7 +358,7 @@ def classify_risk_regimes() -> pd.DataFrame:
     for s, label in mapping.items():
         out[f"prob_{label}"] = post[:, s]
     for r in REGIME_ORDER:
-        col = f"prob_{r}" 
+        col = f"prob_{r}"
         if col not in out.columns:
             out[col] = 0.0
 
@@ -258,8 +372,10 @@ def classify_risk_regimes() -> pd.DataFrame:
             _plot_scatter_feats(out, feat.columns, pdf)
 
     return out
-# ----------------------------------------------------------------------------
-# 5. Plotting helpers (omitted for brevity) ------------------------------------
+
+# ----------------------------------------------------------------------------- 
+# Plotting helpers (omitted for brevity) --------------------------------------- 
+# -----------------------------------------------------------------------------
 def _plot_price_shade(df: pd.DataFrame, pdf: PdfPages | None = None):
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(df.index, df["Close"], label="Close")
@@ -284,7 +400,6 @@ def _plot_price_shade(df: pd.DataFrame, pdf: PdfPages | None = None):
         plt.show()
     plt.close(fig)
 
-
 def _plot_return_hist(df: pd.DataFrame, pdf: PdfPages | None = None):
     fig, ax = plt.subplots(figsize=(12, 5))
     for regime in REGIME_ORDER:
@@ -301,7 +416,6 @@ def _plot_return_hist(df: pd.DataFrame, pdf: PdfPages | None = None):
     if PLOT:
         plt.show()
     plt.close(fig)
-
 
 def _plot_scatter_feats(df: pd.DataFrame, feat_cols: list[str], pdf: PdfPages | None = None):
     for x, y in itertools.combinations(feat_cols, 2):
@@ -328,12 +442,10 @@ def _plot_scatter_feats(df: pd.DataFrame, feat_cols: list[str], pdf: PdfPages | 
             plt.show()
         plt.close(fig)
 
-
 def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages | None = None):
-    # Use only regimes for which probability columns exist
     regimes_present = [r for r in REGIME_ORDER if f"prob_{r}" in df]
-    prob_vals       = [df[f"prob_{r}"] for r in regimes_present]
-    colors          = [COLOR_MAP[r]     for r in regimes_present]
+    prob_vals = [df[f"prob_{r}"] for r in regimes_present]
+    colors = [COLOR_MAP[r] for r in regimes_present]
 
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.stackplot(df.index, *prob_vals, labels=regimes_present, colors=colors, alpha=0.6)
@@ -346,10 +458,9 @@ def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages | None = None):
         plt.show()
     plt.close(fig)
 
+# ----------------------------------------------------------------------------- 
+# SUMMARY‑PAGE PLOTTER (FIRST PAGE IN PDF) 
 # -----------------------------------------------------------------------------
-# SUMMARY‑PAGE PLOTTER (FIRST PAGE IN PDF)
-# -----------------------------------------------------------------------------
-
 def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
     results = []
     for regime in REGIME_ORDER:
@@ -440,10 +551,9 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
         plt.show()
     plt.close(fig)
 
+# ----------------------------------------------------------------------------- 
+# TRANSITION MATRIX PAGE (SECOND PAGE IN PDF) 
 # -----------------------------------------------------------------------------
-# TRANSITION MATRIX PAGE (SECOND PAGE IN PDF)
-# -----------------------------------------------------------------------------
-
 def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
     regimes = [r for r in REGIME_ORDER if r in df["regime"].unique()]
     n = len(regimes)
@@ -467,7 +577,7 @@ def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
 
     forecast_steps = [1, 5, 20, 50]
     lookback_days  = [1, 5, 20, 50]
-    txt_lines: list[str] = []
+    txt_lines = []
 
     # current state
     txt_lines.append(f"Current state → {current_state}")
@@ -536,10 +646,10 @@ def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
         plt.show()
     plt.close(fig)
 
-# ----------------------------------------------------------------------------
-# Main ------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
+# Main ------------------------------------------------------------------------ 
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     df = classify_risk_regimes()
-    # show final rows
-    prob_cols = [c for c in df.columns if isinstance(c,str) and c.startswith("prob_")]
-    print(df.tail()[["Close","regime"]+prob_cols])
+    prob_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("prob_")]
+    print(df.tail()[["Close", "regime"] + prob_cols])
