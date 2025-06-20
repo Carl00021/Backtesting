@@ -1,224 +1,253 @@
-# risk_regime_hmm.py (formerly "Markov Model.py")
+# Markov Model.py – sticky HMM with adaptive detection
 # -----------------------------------------------------------------------------
-# Detects market regimes for a stock using a Hidden Markov Model (HMM).
-# Adds a **fifth** optional "neutral" regime that captures the central
-# x percent of the return‑mean distribution (default 50 %).  Setting
-# `NEUTRAL_PCT = 0.0` fully disables the neutral regime and restores the
-# original four‑state behaviour.
+# Detects market regimes via a Hidden Markov Model (HMM) with:
+#   • Sticky‑state persistence
+#   • Adaptive rolling refits + probability triggers
+# Robustness fixes ensure numerical stability (no NaNs in startprob_ / transmat_).
 # -----------------------------------------------------------------------------
 
-# -----------------------------------------------------------------------------
-# Dependencies: pip install yfinance hmmlearn pandas numpy matplotlib
-# -----------------------------------------------------------------------------
 import os
 import itertools
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from hmmlearn.hmm import GaussianHMM
+from hmmlearn.hmm import GaussianHMM, GMMHMM
 from scipy.stats import skew, kurtosis
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-from datetime import datetime
+
+# Avoid MKL+KMeans memory‑leak warning on Windows (harmless but noisy)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 # === USER CONFIGURATION =======================================================
-TICKER            = "SPY"           # Yahoo Finance ticker
-START_DATE        = "2000-01-01"    # Analysis start date (YYYY-MM-DD)
-END_DATE          = None              # End date (YYYY-MM-DD) or None for today
-PLOT              = False             # Show exploratory plots               
-SAVE_PDF          = True              # Save all plots to PDF
-REPORT_DIR = "Reports"
-os.makedirs(REPORT_DIR, exist_ok=True)
-today     = datetime.now().strftime("%Y-%m-%d")
-PDF_PATH  = os.path.join(REPORT_DIR,f"{TICKER}_risk_regimes_{today}.pdf")
+TICKER              = "SPY"
+START_DATE          = "2015-01-01"
+END_DATE            = None            # None ⇒ today
+PLOT                = False
+SAVE_PDF            = True
+REPORT_DIR          = "Reports"
 
-# -----------------------------------------------------------------------------
-# Regime configuration
-# -----------------------------------------------------------------------------
-N_STATES          = 5                 # Total HMM states (set to 5 to use neutral)
-SEED              = 42                # RNG seed for reproducibility
+# HMM / Regime ----------------------------------------------------------------
+N_STATES            = 5
+SEED                = 42
+STICKINESS          = 5.0             # Dirichlet prior boost on self‑transitions
+MIN_SELF_PROB       = 0.0             # 0 ⇒ off
+COVARIANCE_TYPE     = "diag"          # "diag" safe; switch to "full" if desired
+MIN_COVAR           = 1e-3            # Regularisation for covariance matrices
 
-# Quantile thresholds for *extreme* regimes (0 < q < 1)
-EXTREME_BEAR_Q    = 0.05              # <= 10th percentile ⇒ extreme_bear
-EXTREME_BULL_Q    = 0.95              # >= 90th percentile ⇒ extreme_bull
+# Adaptive detection ----------------------------------------------------------
+ADAPTIVE_WINDOW     = 252             # rolling look‑back (≈1 year)
+ADAPTIVE_FREQ       = 5               # refit every N days
+PROB_THRESH         = 0.6             # posterior threshold
+PROB_CONSEC_DAYS    = 2               # consecutive confirmations
 
-# Width of the neutral band expressed as a proportion of the distribution.
-# 0.50 → central 50 % (25th–75th percentile).
-# 0.00 → neutral regime disabled (original 4‑regime model).
-NEUTRAL_PCT       = 0.250              # 0 ≤ x ≤ 1
+# Regime mapping --------------------------------------------------------------
+EXTREME_BEAR_Q      = 0.10
+EXTREME_BULL_Q      = 0.90
+NEUTRAL_PCT         = 0.40            # 0 ⇒ disable neutral regime
 
-# -----------------------------------------------------------------------------
-# Feature windows / toggles
-# -----------------------------------------------------------------------------
-VOL_Z_WINDOW      = 30                # Days for volume z‑score
-VOL_WINDOW        = 20                # Days for realised volatility
-USE_VIX           = True              # Include ^VIX daily return
-VIX_TICKER        = "^VIX"           # External volatility index ticker
-USE_SPREAD        = True              # Include bid‑ask spread proxy
-SPREAD_METHOD     = "high_low"       # Only (High‑Low)/Close currently
-USE_SENTIMENT     = False             # Include sentiment score feature
-SENTIMENT_PATH    = "sentiment.csv"  # CSV with Date,sentiment columns
-
-# -----------------------------------------------------------------------------
-# Display order & colours
-# -----------------------------------------------------------------------------
-REGIME_ORDER = [
-    "extreme_bull",
-    "bull",
-    "neutral",   # central band (optionally disabled)
-    "bear",
-    "extreme_bear",
+REGIME_ORDER        = [
+    "extreme_bull", "bull", "neutral", "bear", "extreme_bear"
 ]
-
-COLOR_MAP = {
-    "extreme_bull":  "#008000",
-    "bull":          "#ACF3AE",
-    "neutral":       "#C0C0C0",
-    "bear":          "#FA6B84",
-    "extreme_bear":  "#990000",
+COLOR_MAP           = {
+    "extreme_bull": "#008000", "bull": "#ACF3AE", "neutral": "#C0C0C0",
+    "bear": "#FA6B84", "extreme_bear": "#990000",
 }
 
+# Feature toggles -------------------------------------------------------------
+VOL_Z_WINDOW        = 30
+VOL_WINDOW          = 20
+USE_VIX             = True
+VIX_TICKER          = "^VIX"
+USE_SPREAD          = True
+SPREAD_METHOD       = "high_low"
+USE_SENTIMENT       = False
+SENTIMENT_PATH      = "sentiment.csv"
+
+# Output path -----------------------------------------------------------------
+os.makedirs(REPORT_DIR, exist_ok=True)
+PDF_PATH = os.path.join(
+    REPORT_DIR,
+    f"{TICKER}_risk_regimes_{datetime.now().strftime('%Y-%m-%d')}.pdf",
+)
+
 # -----------------------------------------------------------------------------
-# 1. Data download helper
+# Helpers                                                                       
 # -----------------------------------------------------------------------------
 
 def _download_yf(ticker: str, start: str, end: str | None = None) -> pd.DataFrame:
     df = yf.download(ticker, start=start, end=end)
     if df.empty:
-        raise ValueError(f"No data found for {ticker} between {start} and {end}.")
+        raise ValueError(f"No data for {ticker}.")
     return df
 
-# -----------------------------------------------------------------------------
-# 2. Feature engineering
-# -----------------------------------------------------------------------------
 
 def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """Create return, volume and optional features."""
-    feat_df = pd.DataFrame(index=df.index)
-    feat_df["log_ret"] = np.log(df["Close"]).diff()
-
-    # volume z‑score
+    f = pd.DataFrame(index=df.index)
+    f["log_ret"]  = np.log(df["Close"]).diff()
     vol_mu = df["Volume"].rolling(VOL_Z_WINDOW).mean()
     vol_sd = df["Volume"].rolling(VOL_Z_WINDOW).std()
-    feat_df["vol_z"] = (df["Volume"] - vol_mu) / vol_sd
-
-    # realised volatility (annualised)
-    feat_df["real_vol"] = feat_df["log_ret"].rolling(VOL_WINDOW).std() * np.sqrt(252)
-
-    # high‑low spread proxy
+    f["vol_z"]    = (df["Volume"] - vol_mu) / vol_sd
+    f["real_vol"] = f["log_ret"].rolling(VOL_WINDOW).std() * np.sqrt(252)
     if USE_SPREAD and SPREAD_METHOD == "high_low":
-        feat_df["spread"] = (df["High"] - df["Low"]) / df["Close"]
-
-    # VIX daily return
+        f["spread"] = (df["High"] - df["Low"]) / df["Close"]
     if USE_VIX:
-        vdf = _download_yf(VIX_TICKER, START_DATE, END_DATE)
-        feat_df["vix_ret"] = np.log(vdf["Close"]).diff().reindex(df.index)
-
-    # optional sentiment
+        vix = _download_yf(VIX_TICKER, START_DATE, END_DATE)
+        f["vix_ret"] = np.log(vix["Close"]).diff().reindex(df.index)
     if USE_SENTIMENT:
         sent = pd.read_csv(SENTIMENT_PATH, parse_dates=["Date"], index_col="Date")
-        sent = sent.reindex(df.index).ffill()
-        for col in sent.columns:
-            feat_df[col] = sent[col]
-
-    return feat_df.dropna()
+        f = f.join(sent, how="left")
+    return f.dropna()
 
 # -----------------------------------------------------------------------------
-# 3. HMM helpers
+# Model fitting & sanitisation ------------------------------------------------
 # -----------------------------------------------------------------------------
+
+def _sanitize_startprob(model: GaussianHMM):
+    sp = model.startprob_
+    if (not np.isfinite(sp).all()) or sp.sum() == 0:
+        model.startprob_ = np.full_like(sp, 1.0 / len(sp))
+    else:
+        model.startprob_ = sp / sp.sum()
+
+
+def _sanitize_transmat(model: GaussianHMM):
+    tm = model.transmat_.copy()
+    if not np.isfinite(tm).all():
+        tm[~np.isfinite(tm)] = 0.0
+    row_sums = tm.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.squeeze() == 0
+    tm[zero_rows] = 1.0 / tm.shape[1]
+    row_sums = tm.sum(axis=1, keepdims=True)
+    model.transmat_ = tm / row_sums
+
 
 def _fit_hmm(X: np.ndarray, k: int, seed: int) -> GaussianHMM:
+    prior = np.full((k, k), 1.0)
+    np.fill_diagonal(prior, STICKINESS)
+
     model = GaussianHMM(
         n_components=k,
-        covariance_type="full",
+        covariance_type=COVARIANCE_TYPE,
         n_iter=1000,
         random_state=seed,
+        transmat_prior=prior,
+        startprob_prior=np.full(k, 1.0),
+        min_covar=MIN_COVAR,
     )
     model.fit(X)
+
+    _sanitize_startprob(model)
+    _sanitize_transmat(model)
+
+    if MIN_SELF_PROB > 0.0:
+        tm   = model.transmat_.copy()
+        diag = np.diag(tm)
+        low  = diag < MIN_SELF_PROB
+        if low.any():
+            tm[low] = tm[low] * (1.0 - MIN_SELF_PROB) / np.clip(1.0 - diag[low], 1e-9, None)
+            np.fill_diagonal(tm, np.maximum(np.diag(tm), MIN_SELF_PROB))
+            model.transmat_ = tm / tm.sum(axis=1, keepdims=True)
     return model
 
 # -----------------------------------------------------------------------------
-# 3b. State‑to‑Regime mapping with neutral support
+# Regime mapping --------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
 def _map_states_to_regimes(hmm: GaussianHMM) -> dict[int, str]:
-    """Map each latent HMM state to a human‑readable regime label.
-
-    The mapping is based on the *mean* of the first feature (log‑return)
-    for each state and quantile thresholds defined above.
-
-    When `NEUTRAL_PCT > 0` **and** `N_STATES >= 5`, a central neutral band
-    of width `NEUTRAL_PCT` is carved out around the median.
-    """
     mu = hmm.means_[:, 0]
-
-    # extreme quantiles
-    q_low_ext  = np.quantile(mu, EXTREME_BEAR_Q)
-    q_high_ext = np.quantile(mu, EXTREME_BULL_Q)
-
-    # central (neutral) band
-    use_neutral = NEUTRAL_PCT > 0 and N_STATES >= 5
-    if use_neutral:
-        half_band = NEUTRAL_PCT / 2.0
-        q_neu_low  = np.quantile(mu, 0.5 - half_band)
-        q_neu_high = np.quantile(mu, 0.5 + half_band)
-    else:
-        q_neu_low = q_neu_high = None
-
-    median_mu = np.median(mu)
-
-    mapping: dict[int, str] = {}
-    for state, m in enumerate(mu):
-        if m <= q_low_ext:
-            label = "extreme_bear"
-        elif m >= q_high_ext:
-            label = "extreme_bull"
+    q_lo, q_hi = np.quantile(mu, EXTREME_BEAR_Q), np.quantile(mu, EXTREME_BULL_Q)
+    use_neu = NEUTRAL_PCT > 0 and N_STATES >= 5
+    if use_neu:
+        half = NEUTRAL_PCT / 2
+        qn_lo = np.quantile(mu, 0.5 - half)
+        qn_hi = np.quantile(mu, 0.5 + half)
+    med = np.median(mu)
+    mapping = {}
+    for s, m in enumerate(mu):
+        if m <= q_lo:
+            mapping[s] = "extreme_bear"
+        elif m >= q_hi:
+            mapping[s] = "extreme_bull"
         else:
-            if use_neutral and q_neu_low <= m <= q_neu_high:
-                label = "neutral"
+            if use_neu and qn_lo <= m <= qn_hi:
+                mapping[s] = "neutral"
             else:
-                label = "bear" if m < median_mu else "bull"
-        mapping[state] = label
+                mapping[s] = "bear" if m < med else "bull"
     return mapping
 
 # -----------------------------------------------------------------------------
-# 4. Classification pipeline (returns DataFrame with posterior probabilities)
+# Adaptive signal generation --------------------------------------------------
+def generate_adaptive_signals(feat: pd.DataFrame) -> pd.DataFrame:
+    signals = []
+    consec  = 0
+    last_lab = None
+    model: GaussianHMM | None = None
+    mapping: dict[int, str] | None = None
+
+    for i in range(ADAPTIVE_WINDOW, len(feat)):
+        if model is None or (i - ADAPTIVE_WINDOW) % ADAPTIVE_FREQ == 0:
+            X_train = feat.iloc[i-ADAPTIVE_WINDOW:i].values
+            model   = _fit_hmm(X_train, N_STATES, SEED)
+            mapping = _map_states_to_regimes(model)
+
+        x_new = feat.iloc[i].values.reshape(1, -1)
+        probs = model.predict_proba(x_new)[0]
+        top_i = int(np.argmax(probs))
+        label = mapping[top_i]
+
+        if probs[top_i] >= PROB_THRESH:
+            consec = consec + 1 if label == last_lab else 1
+        else:
+            consec = 0
+
+        if consec >= PROB_CONSEC_DAYS:
+            signals.append({
+                "date": feat.index[i],
+                "regime": label,
+                "prob": probs[top_i],
+            })
+        last_lab = label
+
+    return pd.DataFrame(signals)
+
 # -----------------------------------------------------------------------------
-
+# Core pipeline ---------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def classify_risk_regimes() -> pd.DataFrame:
-    """Complete workflow: download → feature engineering → HMM → mapping."""
-    raw      = _download_yf(TICKER, START_DATE, END_DATE)
-    feat_df  = _feature_engineering(raw)
-    X        = feat_df.values
+    raw  = _download_yf(TICKER, START_DATE, END_DATE)
+    feat = _feature_engineering(raw)
 
-    # fit HMM and compute posteriors (gamma probabilities)
-    model       = _fit_hmm(X, N_STATES, SEED)
-    posteriors  = model.predict_proba(X)            # shape (n_samples, n_states)
+    # --- Adaptive detection signals (Suggestion 3) -------------------------
+    signals_df = generate_adaptive_signals(feat)
+    print("Adaptive detection signals:\n", signals_df)
 
-    # map states to labels & derive most probable path
-    mapping     = _map_states_to_regimes(model)
-    state_seq   = model.predict(X)
-    regimes     = np.vectorize(mapping.get)(state_seq)
+    X     = feat.values
+    model = _fit_hmm(X, N_STATES, SEED)
+    post  = model.predict_proba(X)
 
-    # assemble output
-    out = raw.loc[feat_df.index].copy()
-    out[feat_df.columns] = feat_df
-    out["regime"]      = regimes
-    out["regime_num"]  = pd.Categorical(regimes, categories=list(dict.fromkeys(REGIME_ORDER)), ordered=True).codes
+    mapping = _map_states_to_regimes(model)
+    states  = model.predict(X)
+    regimes = np.vectorize(mapping.get)(states)
 
-    # probability columns present in mapping
-    for state, label in mapping.items():
-        out[f"prob_{label}"] = posteriors[:, state]
+    out = raw.loc[feat.index].copy()
+    out[feat.columns] = feat
+    out["regime"]     = regimes
+    out["regime_num"] = pd.Categorical(
+        regimes,
+        categories=list(dict.fromkeys(REGIME_ORDER)),
+        ordered=True
+    ).codes
 
-    # ensure *all* regimes in REGIME_ORDER have a probability column
-    for regime in REGIME_ORDER:
-        col = f"prob_{regime}"
-        if col not in out:
+    for s, label in mapping.items():
+        out[f"prob_{label}"] = post[:, s]
+    for r in REGIME_ORDER:
+        col = f"prob_{r}" 
+        if col not in out.columns:
             out[col] = 0.0
 
-    # ---------------------------------------------------------------------
-    # Plotting & PDF export
-    # ---------------------------------------------------------------------
     if SAVE_PDF:
         with PdfPages(PDF_PATH) as pdf:
             _plot_summary_stats(out, pdf)
@@ -226,22 +255,11 @@ def classify_risk_regimes() -> pd.DataFrame:
             _plot_price_shade(out, pdf)
             _plot_posteriors(out, pdf)
             _plot_return_hist(out, pdf)
-            _plot_scatter_feats(out, feat_df.columns, pdf)
-
-    if PLOT:
-        _plot_summary_stats(out)
-        _plot_transition_matrix(out)
-        _plot_price_shade(out)
-        _plot_posteriors(out)
-        _plot_return_hist(out)
-        _plot_scatter_feats(out, feat_df.columns)
+            _plot_scatter_feats(out, feat.columns, pdf)
 
     return out
-
-# -----------------------------------------------------------------------------
-# 5. Plotting helpers (all respect optional neutral regime)
-# -----------------------------------------------------------------------------
-
+# ----------------------------------------------------------------------------
+# 5. Plotting helpers (omitted for brevity) ------------------------------------
 def _plot_price_shade(df: pd.DataFrame, pdf: PdfPages | None = None):
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(df.index, df["Close"], label="Close")
@@ -518,10 +536,10 @@ def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
         plt.show()
     plt.close(fig)
 
-# -----------------------------------------------------------------------------
-# Script entry‑point
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Main ------------------------------------------------------------------------
 if __name__ == "__main__":
     df = classify_risk_regimes()
-    prob_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("prob_")]
-    print(df.tail()[["Close", "regime"] + prob_cols])
+    # show final rows
+    prob_cols = [c for c in df.columns if isinstance(c,str) and c.startswith("prob_")]
+    print(df.tail()[["Close","regime"]+prob_cols])
