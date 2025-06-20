@@ -41,7 +41,7 @@ N_STATES            = 5
 SEED                = 42
 STICKINESS          = 5.0             # Dirichlet prior boost on self-transitions
 MIN_SELF_PROB       = 0.0             # 0 ⇒ off
-COVARIANCE_TYPE     = "full"          # "diag" safe; switch to "full" if desired
+COVARIANCE_TYPE     = "full"          # "diag" safe; tied, or switch to "full" if desired
 MIN_COVAR           = 1e-3            # Regularisation for covariance matrices
 
 # Adaptive detection ----------------------------------------------------------
@@ -53,7 +53,7 @@ PROB_CONSEC_DAYS    = 2               # consecutive confirmations
 # Regime mapping --------------------------------------------------------------
 EXTREME_BEAR_Q      = 0.10
 EXTREME_BULL_Q      = 0.90
-NEUTRAL_PCT         = 0.35            # 0 ⇒ disable neutral regime
+NEUTRAL_PCT         = 0.0            # 0 ⇒ disable neutral regime
 
 REGIME_ORDER        = [
     "extreme_bull", "bull", "neutral", "bear", "extreme_bear"
@@ -109,6 +109,32 @@ def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------- 
 # Model fitting & sanitisation ------------------------------------------------ 
 # -----------------------------------------------------------------------------
+def force_spd(matrix: np.ndarray, floor: float = 1e-6) -> np.ndarray:
+    """
+    Make a covariance matrix symmetric-positive-definite by
+    bumping the spectrum until the smallest eigenvalue ≥ `floor`.
+    Works in-place and returns the fixed matrix.
+    """
+    # symmetrise first (numerical noise)
+    matrix[:] = 0.5 * (matrix + matrix.T)
+
+    # eigen-decomposition is cheaper than repeated Cholesky
+    w, V = linalg.eigh(matrix, lower=True)
+    if np.min(w) < floor:
+        w = np.clip(w, floor, None)
+        matrix[:] = (V * w) @ V.T
+
+    # final cheap guarantee (add jitter if Cholesky still fails)
+    jitter = floor
+    while True:
+        try:
+            _ = linalg.cholesky(matrix, lower=True)
+            break
+        except linalg.LinAlgError:
+            matrix += np.eye(matrix.shape[0]) * jitter
+            jitter *= 10
+    return matrix
+
 def _sanitize_startprob(model):
     sp = model.startprob_
     if (not np.isfinite(sp).all()) or sp.sum() == 0:
@@ -139,111 +165,157 @@ def _sanitize_means(model):
     if hasattr(model, "means_"):
         model.means_ = np.nan_to_num(model.means_, nan=0.0, posinf=0.0, neginf=0.0)
 
-def _sanitize_covars(model):
-    if not hasattr(model, "covars_"):
+def _sanitize_covars(model, floor: float = 1e-6):
+    """Ensure every covariance in the model is SPD."""
+    if getattr(model, "covariance_type", "diag") == "diag":
+        # diag ⇒ just clamp variances
+        model.covars_ = np.maximum(model.covars_, floor)
         return
-    
-    MIN_COVAR = globals().get("MIN_COVAR", 1e-6)
-    
-    if model.covariance_type == "diag":
-        if isinstance(model, GMMHMM):
-            expected_shape = (model.n_components, model.n_mix, model.n_features)
-        else:
-            expected_shape = (model.n_components, model.n_features)
-        if model.covars_.shape != expected_shape:
-            print(f"Warning: covars_ shape {model.covars_.shape} does not match "
-                  f"expected {expected_shape}, reinitializing with MIN_COVAR")
-            model.covars_ = np.full(expected_shape, MIN_COVAR)
-        else:
-            model.covars_ = np.nan_to_num(model.covars_, nan=MIN_COVAR, posinf=MIN_COVAR, neginf=MIN_COVAR)
-            model.covars_ = np.maximum(model.covars_, MIN_COVAR)
-            if np.any(model.covars_ <= 0):
-                print("Warning: Some variances are non-positive, setting to MIN_COVAR")
-                model.covars_[model.covars_ <= 0] = MIN_COVAR
-    elif model.covariance_type == "full":
-        for i in range(model.n_components):
-            for j in range(model.n_mix if isinstance(model, GMMHMM) else 1):
-                cov = model.covars_[i, j].copy() if isinstance(model, GMMHMM) else model.covars_[i].copy()
-                if not np.all(np.isfinite(cov)):
-                    cov = np.eye(model.n_features) * MIN_COVAR
-                else:
-                    try:
-                        linalg.cholesky(cov)
-                    except linalg.LinAlgError:
-                        epsilon = MIN_COVAR
-                        while True:
-                            try:
-                                linalg.cholesky(cov + epsilon * np.eye(model.n_features))
-                                break
-                            except linalg.LinAlgError:
-                                epsilon *= 10
-                        cov += epsilon * np.eye(model.n_features)
-                if isinstance(model, GMMHMM):
-                    model.covars_[i, j] = cov
-                else:
-                    model.covars_[i] = cov
+
+    # full or tied
+    if model.covariance_type == "tied":      # one per state
+        for s in range(model.covars_.shape[0]):
+            force_spd(model.covars_[s], floor)
+    else:                                    # full GMM ⇒ state × mix
+        for s in range(model.covars_.shape[0]):
+            for m in range(model.covars_.shape[1]):
+                force_spd(model.covars_[s, m], floor)
+
 
 def _fit_hmm(X: np.ndarray, k: int, seed: int):
+    import numpy as np
+    from hmmlearn.hmm import GaussianHMM, GMMHMM
+    from sklearn.mixture import GaussianMixture
+    import scipy.linalg as linalg
+
+    # 1. Standardize
     mean = np.mean(X, axis=0)
-    std = np.std(X, axis=0)
-    std = np.maximum(std, 1e-8)
+    std  = np.std(X, axis=0)
+    std  = np.maximum(std, 1e-8)
     X_std = (X - mean) / std
 
+    # 2. Build transition prior
     prior = np.full((k, k), 1.0)
     np.fill_diagonal(prior, STICKINESS)
 
-    def _make_model(reg_covar):
-        if MODEL_TYPE == "GaussianHMM":
-            return GaussianHMM(
-                n_components=k,
-                covariance_type=COVARIANCE_TYPE,
-                n_iter=1000,
-                random_state=seed,
-                transmat_prior=prior,
-                startprob_prior=np.full(k, 1.0),
-                min_covar=reg_covar,
-            )
-        elif MODEL_TYPE == "GMMHMM":
-            return GMMHMM(
-                n_components=k,
-                n_mix=N_MIX,
-                covariance_type=COVARIANCE_TYPE,
-                n_iter=1000,
-                random_state=seed,
-                transmat_prior=prior,
-                startprob_prior=np.full(k, 1.0),
-                min_covar=reg_covar,
-            )
-        else:
-            raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
+    # 3. Determine model & covariance trial order
+    model_order = [MODEL_TYPE]
+    if MODEL_TYPE == "GMMHMM":
+        model_order.append("GaussianHMM")
+    else:
+        model_order.append("GMMHMM")
 
-    reg = MIN_COVAR
-    for attempt in range(4):
-        model = _make_model(reg)
-        try:
-            model.fit(X_std)
+    cov_order = [COVARIANCE_TYPE]
+    alt_cov = "diag" if COVARIANCE_TYPE != "diag" else "full"
+    cov_order.append(alt_cov)
+
+    last_err = None
+
+    # 4. Try every (model_type, cov_type) combo
+    for mtype in model_order:
+        for cov_type in cov_order:
+
+            # 4a. If GMMHMM, pre-fit a GaussianMixture for emissions
+            if mtype == "GMMHMM":
+                total_comps = k * N_MIX
+                gmm = GaussianMixture(
+                    n_components=total_comps,
+                    covariance_type=cov_type,
+                    reg_covar=MIN_COVAR,
+                    max_iter=200,
+                    random_state=seed
+                ).fit(X_std)
+
+                n_feat = X_std.shape[1]
+                means_hmm   = gmm.means_.reshape(k, N_MIX, n_feat)
+                weights_hmm = gmm.weights_.reshape(k, N_MIX)
+                # normalize
+                weights_hmm /= weights_hmm.sum(axis=1, keepdims=True)
+
+                if cov_type == "diag":
+                    covars_hmm = gmm.covariances_.reshape(k, N_MIX, n_feat)
+                else:
+                    covars_hmm = gmm.covariances_.reshape(k, N_MIX, n_feat, n_feat)
+
+            # 4b. Build factory for this combo
+            def make_model(reg_covar):
+                if mtype == "GaussianHMM":
+                    return GaussianHMM(
+                        n_components=k,
+                        covariance_type=cov_type,
+                        n_iter=1000,
+                        random_state=seed,
+                        transmat_prior=prior,
+                        startprob_prior=np.full(k, 1.0),
+                        min_covar=reg_covar,
+                    )
+                else:
+                    return GMMHMM(
+                        n_components=k,
+                        n_mix=N_MIX,
+                        covariance_type=cov_type,
+                        n_iter=1000,
+                        random_state=seed,
+                        transmat_prior=prior,
+                        startprob_prior=np.full(k, 1.0),
+                        min_covar=reg_covar,
+                    )
+
+            # 4c. Try EM with increasing regularization
+            reg = MIN_COVAR
+            for attempt in range(4):
+                model = make_model(reg)
+                if mtype == "GMMHMM":
+                    model.means_   = means_hmm
+                    model.covars_  = covars_hmm
+                    model.weights_ = weights_hmm
+                    model.init_params = ""  # freeze emissions
+
+                try:
+                    model.fit(X_std)
+                    _sanitize_covars(model)
+                    # record successful combo
+                    final_model_type = mtype
+                    final_cov_type   = cov_type
+                    break
+                except Exception as e:
+                    last_err = e
+                    reg *= 10
+            else:
+                # this cov_type failed for this model_type
+                continue
+
+            # broke out of inner loop successfully
             break
-        except (ValueError, np.linalg.LinAlgError) as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
-            reg *= 10
-            if attempt == 3:
-                raise RuntimeError("HMM failed to converge after retries.") from e
+        else:
+            # this model_type failed all covariances
+            continue
+        # model_type succeeded
+        break
+    else:
+        # all four combos failed
+        raise RuntimeError(
+            f"HMM failed for all combos {model_order}×{cov_order}, last error:\n{last_err}"
+        )
 
+    # 5. Final sanitization
     _sanitize_startprob(model)
     _sanitize_transmat(model)
-    if MODEL_TYPE == "GMMHMM":
+    if final_model_type == "GMMHMM":
         _sanitize_gmm_weights(model)
     _sanitize_means(model)
     _sanitize_covars(model)
 
+    # 6. Enforce minimum self-transition
     if MIN_SELF_PROB > 0.0:
         tm = model.transmat_.copy()
-        diag = np.diag(tm)
-        low = diag < MIN_SELF_PROB
+        diag_probs = np.diag(tm)
+        low = diag_probs < MIN_SELF_PROB
         if low.any():
-            tm[low] = tm[low] * (1.0 - MIN_SELF_PROB) / np.clip(1.0 - diag[low], 1e-9, None)
-            np.fill_diagonal(tm, np.maximum(diag, MIN_SELF_PROB))
+            tm[low] = tm[low] * (1.0 - MIN_SELF_PROB) / np.clip(1 - diag_probs[low], 1e-9, None)
+            np.fill_diagonal(tm, np.maximum(diag_probs, MIN_SELF_PROB))
             model.transmat_ = tm / tm.sum(axis=1, keepdims=True)
+
     return model, mean, std
 
 # ----------------------------------------------------------------------------- 
@@ -298,6 +370,7 @@ def generate_adaptive_signals(feat: pd.DataFrame) -> pd.DataFrame:
         x_new_std = x_new_std.reshape(1, -1)
         for attempt in range(4):
             try:
+                _sanitize_covars(model) 
                 probs = model.predict_proba(x_new_std)[0]
                 break
             except Exception as e:
@@ -459,96 +532,81 @@ def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages | None = None):
     plt.close(fig)
 
 # ----------------------------------------------------------------------------- 
-# SUMMARY‑PAGE PLOTTER (FIRST PAGE IN PDF) 
+# SUMMARY-PAGE PLOTTER (FIRST PAGE IN PDF) 
 # -----------------------------------------------------------------------------
 def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
+    # determine end date
+    date_end = END_DATE if END_DATE else pd.Timestamp.today().strftime("%Y-%m-%d")
+    # key parameters lines
+    line1 = f"HMM: {MODEL_TYPE}, Cov: {COVARIANCE_TYPE}"
+    line2 = f"Adaptive: window={ADAPTIVE_WINDOW}d, freq={ADAPTIVE_FREQ}d, thresh={PROB_THRESH:.2f}"
+    line3 = f"Regime mapping: Q_lo={EXTREME_BEAR_Q}, Q_hi={EXTREME_BULL_Q}, NeuPct={NEUTRAL_PCT}"
+
+    # compute stats
     results = []
     for regime in REGIME_ORDER:
         mask = df["regime"] == regime
-        if not mask.any():
-            continue
+        if not mask.any(): continue
         ret_col = "ret" if "ret" in df.columns else "log_ret"
         rets = df.loc[mask, ret_col]
         count = mask.sum()
-        mean_ret = rets.mean()
-        ann_vol = rets.std() * np.sqrt(252)
+        mean_ret = rets.mean(); ann_vol = rets.std() * np.sqrt(252)
         sharpe = mean_ret / (ann_vol + 1e-9)
-        downside_std = rets[rets < 0].std() * np.sqrt(252)
-        sortino = mean_ret / (downside_std + 1e-9)
-        cum = (1 + rets).cumprod()
-        drawdown = (cum - cum.cummax()) / cum.cummax()
-        max_dd = drawdown.min()
-        sk = skew(rets)
-        kt = kurtosis(rets)
-        z_95 = 1.64485
-        var95 = -(mean_ret + z_95 * rets.std())
-        es95 = -mean_ret + rets.std() * (np.exp(-z_95**2 / 2) / (np.sqrt(2 * np.pi) * (1 - 0.95)))
-        post_col = df[f"prob_{regime}"] if f"prob_{regime}" in df else pd.Series(index=df.index, data=np.nan)
-        avg_post = post_col.mean()
-        last_post = post_col.iloc[-1] if not post_col.empty else np.nan
-        transitions = df["regime"].shift().fillna(regime).astype(str) + "_" + df["regime"].astype(str)
-        n_starts = (transitions == f"{regime}_{regime}").sum()
-        exp_dur = count / max(n_starts, 1)
+        neg = rets[rets < 0]
+        downside = neg.std() * np.sqrt(252) if not neg.empty else 0.0
+        sortino = mean_ret / (downside + 1e-9)
+        cum = (1 + rets).cumprod(); max_dd = ((cum - cum.cummax())/cum.cummax()).min()
+        sk = skew(rets); kt = kurtosis(rets)
+        z95 = 1.64485
+        var95 = -(mean_ret + z95 * rets.std())
+        es95 = -mean_ret + rets.std() * (np.exp(-z95**2/2)/(np.sqrt(2*np.pi)*(1-0.95)))
+        post = df.get(f"prob_{regime}", pd.Series(np.nan, index=df.index))
+        avg_post = post.mean(); last_post = post.iloc[-1] if not post.empty else np.nan
+        trans = df["regime"].shift().fillna(regime) + "_" + df["regime"]
+        starts = (trans == f"{regime}_{regime}").sum()
+        exp_dur = count / max(starts, 1)
         results.append([
-            regime,
-            count,
-            round(mean_ret, 4),
-            round(ann_vol, 4),
-            round(sharpe, 2),
-            round(sortino, 2),
-            round(max_dd, 2),
-            round(sk, 2),
-            round(kt, 2),
-            round(var95, 4),
-            round(es95, 4),
-            round(avg_post, 3),
-            round(last_post, 3),
-            round(exp_dur, 1),
+            regime, count, round(mean_ret,4), round(ann_vol,4),
+            round(sharpe,2), round(sortino,2), round(max_dd,2),
+            round(sk,2), round(kt,2), round(var95,4),
+            round(es95,4), round(avg_post,3), round(last_post,3), round(exp_dur,1)
         ])
-
     col_labels = [
-        "Regime",
-        "Count",
-        "Mean",
-        "Ann σ",
-        "Sharpe",
-        "Sortino",
-        "MaxDD",
-        "Skew",
-        "Kurt",
-        "VaR95",
-        "ES95",
-        "Avg Post",
-        "Last Post",
-        "Exp Dur",
+        "Regime","Count","Mean","Ann σ","Sharpe","Sortino",
+        "MaxDD","Skew","Kurt","VaR95","ES95",
+        "AvgPost","LastPost","ExpDur"
     ]
 
-    fig, ax = plt.subplots(figsize=(11, 8.5))
-    # Add a big page title
-    date_end = END_DATE if END_DATE else pd.Timestamp.today().strftime("%Y-%m-%d")
+    # figure setup
+    fig = plt.figure(figsize=(11, 8.5))
+    # title
     fig.suptitle(
         f"{TICKER} Risk Regime Analysis  ({START_DATE} → {date_end})",
-        fontsize=18,
-        fontweight="bold",
-        y=0.98
+        fontsize=18, fontweight="bold", y=0.98
     )
-    ax.axis("off")
-    
-    tbl = ax.table(
+    # parameters subtitle and text
+    fig.text(0.02, 0.945, "Parameters:", ha="left", va="bottom", fontsize=11, fontweight="bold")
+    fig.text(0.02, 0.93, "\n".join([line1, line2, line3]),
+             ha="left", va="top", fontsize=10, family="monospace")
+    # statistics subtitle
+    fig.text(0.02, 0.60, "Statistics", ha="left", va="bottom", fontsize=11, fontweight="bold")
+
+    # stats table axes below subtitle
+    ax_tbl = fig.add_axes([0.02, 0.05, 0.96, 0.50])  # [left, bottom, width, height]
+    ax_tbl.axis("off")
+    tbl = ax_tbl.table(
         cellText=results,
         colLabels=col_labels,
-        loc="upper center",
         cellLoc="center",
-        colWidths=[0.07] + [0.06] * 13,
+        colWidths=[0.07] + [0.065]*13
     )
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(8)
     tbl.scale(1, 1.5)
+
     plt.tight_layout()
-    if pdf:
-        pdf.savefig(fig)
-    if PLOT:
-        plt.show()
+    if pdf: pdf.savefig(fig)
+    if PLOT: plt.show()
     plt.close(fig)
 
 # ----------------------------------------------------------------------------- 
@@ -558,92 +616,75 @@ def _plot_transition_matrix(df: pd.DataFrame, pdf: PdfPages | None = None):
     regimes = [r for r in REGIME_ORDER if r in df["regime"].unique()]
     n = len(regimes)
 
-    # empirical transition counts & probabilities
-    trans_counts = np.zeros((n, n))
+    # 1-step transition probabilities
+    counts = np.zeros((n, n))
     prev = df["regime"].iloc[0]
     for curr in df["regime"].iloc[1:]:
-        if prev not in regimes or curr not in regimes:
-            prev = curr
-            continue
-        i, j = regimes.index(prev), regimes.index(curr)
-        trans_counts[i, j] += 1
+        if prev in regimes and curr in regimes:
+            i, j = regimes.index(prev), regimes.index(curr)
+            counts[i, j] += 1
         prev = curr
-    with np.errstate(invalid="ignore", divide="ignore"):
-        trans_prob = np.nan_to_num(trans_counts / trans_counts.sum(axis=1, keepdims=True))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        trans_prob = np.nan_to_num(counts / counts.sum(axis=1, keepdims=True))
 
-    # current state & last posteriors
-    current_state = df["regime"].iloc[-1]
-    last_probs = np.array([df[f"prob_{r}"].iloc[-1] for r in regimes])
+    # 20-step
+    trans_prob_20 = np.linalg.matrix_power(trans_prob, 20)
 
-    forecast_steps = [1, 5, 20, 50]
-    lookback_days  = [1, 5, 20, 50]
-    txt_lines = []
-
-    # current state
-    txt_lines.append(f"Current state → {current_state}")
-    txt_lines.append("")
-
-    # forward forecasts
-    for k in forecast_steps:
-        tp_k = np.linalg.matrix_power(trans_prob, k) if k > 1 else trans_prob
-        probs_k = last_probs @ tp_k
-        mode_k = regimes[int(np.argmax(probs_k))]
-        txt_lines.append(
-            f"{k}-step forecast → {mode_k} | " + 
-            ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, probs_k)])
-        )
-    txt_lines.append("")
-
-    # backward‑looking one‑step forecasts
-    for d in lookback_days:
+    # text forecast block
+    current = df["regime"].iloc[-1]
+    last_p = np.array([df[f"prob_{r}"].iloc[-1] for r in regimes])
+    txt = [f"Current state → {current}", ""]
+    for k in (1,5,20,50):
+        mat = trans_prob if k==1 else np.linalg.matrix_power(trans_prob, k)
+        p = last_p @ mat
+        mode = regimes[int(np.argmax(p))]
+        txt.append(f"{k}-step forecast → {mode} | " +
+                   ", ".join(f"{r}: {v:.2f}" for r,v in zip(regimes,p)))
+    txt.append("")
+    for d in (1,5,20,50):
         if d <= len(df):
-            posterior_d = np.array([df[f"prob_{r}"].iloc[-d] for r in regimes])
-            f1 = posterior_d @ trans_prob
-            mode1 = regimes[int(np.argmax(f1))]
-            txt_lines.append(
-                f"1‑step forecast from {d}-day ago → {mode1} | " + 
-                ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, f1)])
-            )
-    txt_lines.append("")
-
-    # 20‑step forecasts from past days
-    for d in lookback_days:
+            post_d = np.array([df[f"prob_{r}"].iloc[-d] for r in regimes])
+            p1 = post_d @ trans_prob
+            m1 = regimes[int(np.argmax(p1))]
+            txt.append(f"1-step from {d}-day ago → {m1} | " +
+                       ", ".join(f"{r}: {v:.2f}" for r,v in zip(regimes,p1)))
+    txt.append("")
+    for d in (1,5,20,50):
         if d <= len(df):
-            posterior_d = np.array([df[f"prob_{r}"].iloc[-d] for r in regimes])
-            f20 = posterior_d @ np.linalg.matrix_power(trans_prob, 20)
-            mode20 = regimes[int(np.argmax(f20))]
-            txt_lines.append(
-                f"20‑step forecast from {d}-day ago → {mode20} | " + 
-                ", ".join([f"{r}: {p:.2f}" for r, p in zip(regimes, f20)])
-            )
+            post_d = np.array([df[f"prob_{r}"].iloc[-d] for r in regimes])
+            p20 = post_d @ trans_prob_20
+            m20 = regimes[int(np.argmax(p20))]
+            txt.append(f"20-step from {d}-day ago → {m20} | " +
+                       ", ".join(f"{r}: {v:.2f}" for r,v in zip(regimes,p20)))
 
-    text_block = "\n".join(txt_lines)
+    # layout: text + two heatmaps
+    fig = plt.figure(figsize=(11, 8.5))
+    gs = fig.add_gridspec(2, 2, height_ratios=[0.4,0.6], width_ratios=[1,1])
+    ax_txt = fig.add_subplot(gs[0, :])
+    ax1   = fig.add_subplot(gs[1, 0])
+    ax2   = fig.add_subplot(gs[1, 1])
 
-    fig, (ax_txt, ax_hm) = plt.subplots(2, 1, figsize=(11, 8.5), gridspec_kw={"height_ratios": [0.4, 0.6]})
-
-    # text panel
+    # text
     ax_txt.axis("off")
-    ax_txt.text(0.5, 0.5, text_block, ha="center", va="center", fontsize=10, family="monospace")
+    ax_txt.text(0.5, 0.5, "\n".join(txt), ha="center", va="center",
+                fontsize=10, family="monospace")
 
-    # heatmap
-    im = ax_hm.imshow(trans_prob, cmap="Blues", vmin=0, vmax=1)
-    ax_hm.set_anchor("C")
-    ax_hm.set_aspect("equal")
-    ax_hm.set_xticks(range(n), regimes, rotation=45, ha="center")
-    ax_hm.set_yticks(range(n), regimes, va="center")
-    ax_hm.set_xlabel("Ending State", labelpad=10, fontsize=12)
-    ax_hm.set_ylabel("Starting State", labelpad=10, fontsize=12)
-    ax_hm.set_title("Empirical Transition Probabilities", fontsize=14)
-    for i in range(n):
-        for j in range(n):
-            ax_hm.text(j, i, f"{trans_prob[i, j]:.2f}", ha="center", va="center")
-    fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
+    # heatmaps (shared vmin/vmax)
+    for ax, mat, title in [(ax1, trans_prob, "1-Step Transition Probabilities"),
+                            (ax2, trans_prob_20, "20-Step Transition Probabilities")]:
+        im = ax.imshow(mat, cmap="Blues", vmin=0, vmax=1)
+        ax.set_title(title)
+        ax.set_xticks(range(n), regimes)
+        ax.set_yticks(range(n), regimes)
+        ax.tick_params(axis='x', labelrotation=45, labelsize=8, pad=10)
+        ax.tick_params(axis='y', labelsize=8)
+        for i in range(n):
+            for j in range(n):
+                ax.text(j,i, f"{mat[i,j]:.2f}", ha="center", va="center", fontsize=8)
 
     plt.tight_layout()
-    if pdf:
-        pdf.savefig(fig)
-    if PLOT:
-        plt.show()
+    if pdf: pdf.savefig(fig)
+    if PLOT: plt.show()
     plt.close(fig)
 
 # ----------------------------------------------------------------------------- 
