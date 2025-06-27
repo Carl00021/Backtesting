@@ -23,8 +23,8 @@ import scipy.linalg as linalg
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 # === USER CONFIGURATION =======================================================
-TICKER              = "QQQ"
-START_DATE          = "2020-01-01"
+TICKER              = "IWM"
+START_DATE          = "2000-01-01"
 END_DATE            = None            # None ⇒ today
 PLOT                = False
 SAVE_PDF            = True
@@ -34,27 +34,27 @@ REPORT_DIR          = "Reports"
 # MODEL_TYPE selects emission model:
 #   • "GaussianHMM" → single Gaussian emission (default: simpler, faster)
 #   • "GMMHMM"     → Gaussian mixture emissions (better for fat-tailed regimes)
-MODEL_TYPE         = "GMMHMM"   # choose between "GaussianHMM" or "GMMHMM"
-N_MIX              = 2                # number of mixtures for GMMHMM (ignored by GaussianHMM)
+MODEL_TYPE         = "GMMHMM"       # choose between "GaussianHMM" or "GMMHMM"
+N_MIX              = 3                #2 = normal + tails, 3 more precise (some overfitting), 4 starts overfitting. # number of mixtures for GMMHMM (ignored by GaussianHMM) 
 
 N_STATES            = 5
 BINARY_MODE = (N_STATES == 2)
 SEED                = 42
-STICKINESS          = 5             # Dirichlet prior boost on self-transitions
+STICKINESS          = 100             # Dirichlet prior boost on self-transitions
 MIN_SELF_PROB       = 0.0             # 0 ⇒ off
 COVARIANCE_TYPE     = "full"          # "diag" safe; tied, or switch to "full" if desired
-MIN_COVAR           = 1e-3            # Regularisation for covariance matrices
+MIN_COVAR           = 1e-6            # Regularisation for covariance matrices
 
 # Adaptive detection ----------------------------------------------------------
-ADAPTIVE_WINDOW     = 252             # rolling look‑back (≈1 year)
+ADAPTIVE_WINDOW     = 60             # rolling look‑back (≈1 year)
 ADAPTIVE_FREQ       = 5               # refit every N days
-PROB_THRESH         = 0.6             # posterior threshold
-PROB_CONSEC_DAYS    = 2               # consecutive confirmations
+PROB_THRESH         = 0.90             # posterior threshold
+PROB_CONSEC_DAYS    = 5               # consecutive confirmations
 
 # Regime mapping --------------------------------------------------------------
 EXTREME_BEAR_Q      = 0.10
 EXTREME_BULL_Q      = 0.90
-NEUTRAL_PCT         = 0            # 0 ⇒ disable neutral regime
+NEUTRAL_PCT         = 0.2            # 0 ⇒ disable neutral regime
 
 REGIME_ORDER        = [
     "extreme_bull", "bull", "neutral", "bear", "extreme_bear"
@@ -72,8 +72,16 @@ VOL_Z_WINDOW        = 30
 VOL_WINDOW          = 20
 USE_VIX             = True
 VIX_TICKER          = "^VIX"
+USE_TLT             = False
+TLT_TICKER          = "^TNX"        # 20+ year Treasury ETF as rate proxy
+USE_SKEW            = True
+SKEW_TICKER         = "^SKEW"       # CBOE SKEW Index
+USE_MOVE            = False         
+MOVE_TICKER         = "^MOVE"       # ICE BofA MOVE Index, Tends to give False signals for bond related stuff.
 USE_SPREAD          = True
 SPREAD_METHOD       = "high_low"
+USE_MOMENTUM        = True
+MOM_PERIOD          = 20            # look‐back window (days) for momentum
 USE_SENTIMENT       = False
 SENTIMENT_PATH      = "sentiment.csv"
 
@@ -81,7 +89,7 @@ SENTIMENT_PATH      = "sentiment.csv"
 os.makedirs(REPORT_DIR, exist_ok=True)
 PDF_PATH = os.path.join(
     REPORT_DIR,
-    f"{TICKER}_risk_regimes_{datetime.now().strftime('%Y-%m-%d')}.pdf",
+    f"{TICKER}_{START_DATE}_to_{END_DATE}risk_regimes_{datetime.now().strftime('%Y-%m-%d')}.pdf",
 )
 
 # ----------------------------------------------------------------------------- 
@@ -105,10 +113,25 @@ def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     if USE_VIX:
         vix = _download_yf(VIX_TICKER, START_DATE, END_DATE)
         f["vix_ret"] = np.log(vix["Close"]).diff().reindex(df.index)
+    if USE_MOMENTUM:
+        f["mom"] = (
+            df["Close"]         # today's price
+            .pct_change(periods=MOM_PERIOD)  # (P_t / P_{t-N}) – 1
+            .reindex(df.index)
+        )
+    if USE_TLT:
+        tlt = _download_yf(TLT_TICKER, START_DATE, END_DATE)
+    if USE_SKEW:
+        skew_df = _download_yf(SKEW_TICKER, START_DATE, END_DATE)
+        f["skew_ret"] = np.log(skew_df["Close"]).diff().reindex(df.index)
+    if USE_MOVE:
+        move_df = _download_yf(MOVE_TICKER, START_DATE, END_DATE)
+        f["move_ret"] = np.log(move_df["Close"]).diff().reindex(df.index)
     if USE_SENTIMENT:
         sent = pd.read_csv(SENTIMENT_PATH, parse_dates=["Date"], index_col="Date")
         f = f.join(sent, how="left")
     return f.dropna()
+
 def _active_regimes() -> list[str]:
     """Return the regimes the rest of the code should use."""
     if BINARY_MODE:                             # two-state model
@@ -560,15 +583,19 @@ def _plot_posteriors(df: pd.DataFrame, pdf: PdfPages | None = None):
 # ----------------------------------------------------------------------------- 
 # SUMMARY-PAGE PLOTTER (FIRST PAGE IN PDF) 
 # -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
+# UPDATED _plot_summary_stats WITH COMBINED STATE SUMMARY, AVG RUN RETURN & HIT RATE
+# -----------------------------------------------------------------------------
 def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
     # determine end date
     date_end = END_DATE if END_DATE else pd.Timestamp.today().strftime("%Y-%m-%d")
     # key parameters lines
-    line1 = f"HMM: {MODEL_TYPE}, Cov: {COVARIANCE_TYPE}, Stickiness: {STICKINESS}"
-    line2 = f"Adaptive: window={ADAPTIVE_WINDOW}d, freq={ADAPTIVE_FREQ}d, thresh={PROB_THRESH:.2f}"
+    line1 = f"HMM: {MODEL_TYPE}, Cov: {COVARIANCE_TYPE}, N Mix: {N_MIX}, Stickiness: {STICKINESS}"
+    line2 = f"Adaptive: window={ADAPTIVE_WINDOW}d, freq={ADAPTIVE_FREQ}d, thresh={PROB_THRESH:.2f}, days={PROB_CONSEC_DAYS:.2f}"
     line3 = f"Regime mapping: Q_lo={EXTREME_BEAR_Q}, Q_hi={EXTREME_BULL_Q}, NeuPct={NEUTRAL_PCT}"
+    line4 = f"Features: Momentum={USE_MOMENTUM}, HighLow={USE_SPREAD}, VIX={USE_VIX}, SKEW={USE_SKEW}, TLT={USE_TLT}, MOVE={USE_MOVE}"
 
-    # compute statistics
+    # compute performance statistics (existing)
     results = []
     for regime in _active_regimes():
         mask = df["regime"] == regime
@@ -576,7 +603,8 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
         ret_col = "ret" if "ret" in df.columns else "log_ret"
         rets = df.loc[mask, ret_col]
         count = mask.sum()
-        mean_ret = rets.mean(); ann_vol = rets.std() * np.sqrt(252)
+        mean_ret = rets.mean(); ann_ret = mean_ret * np.sqrt(252)
+        ann_vol = rets.std() * np.sqrt(252)
         sharpe = mean_ret / (ann_vol + 1e-9)
         neg = rets[rets < 0]
         downside = neg.std() * np.sqrt(252) if not neg.empty else 0.0
@@ -592,33 +620,26 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
         starts = (trans == f"{regime}_{regime}").sum()
         exp_dur = count / max(starts, 1)
         results.append([
-            regime, count, round(mean_ret,4), round(ann_vol,4),
+            regime, count, round(ann_ret,4), round(ann_vol,4),
             round(sharpe,2), round(sortino,2), round(max_dd,2),
             round(sk,2), round(kt,2), round(var95,4),
             round(es95,4), round(avg_post,3), round(last_post,3), round(exp_dur,1)
         ])
     col_labels = [
-        "Regime","Count","Mean","Ann σ","Sharpe","Sortino",
+        "Regime","Count","Ann Ret","Ann σ","Sharpe","Sortino",
         "MaxDD","Skew","Kurt","VaR95","ES95",
         "AvgPost","LastPost","ExpDur"
     ]
 
     # figure setup
     fig = plt.figure(figsize=(11, 8.5))
-    # title
-    fig.suptitle(
-        f"{TICKER} Risk Regime Analysis  ({START_DATE} → {date_end})",
-        fontsize=18, fontweight="bold", y=0.97
-    )
-    # parameters subtitle and text (lowered)
+    fig.suptitle(f"{TICKER} Risk Regime Analysis  ({START_DATE} → {date_end})",fontsize=18, fontweight="bold", y=0.97)
     fig.text(0.02, 0.90, "Parameters:", ha="left", va="bottom", fontsize=11, fontweight="bold")
-    fig.text(0.02, 0.87, "\n".join([line1, line2, line3]),
-             ha="left", va="top", fontsize=10, family="monospace")
-    # statistics subtitle
-    fig.text(0.02, 0.65, "Statistics", ha="left", va="bottom", fontsize=11, fontweight="bold")
+    fig.text(0.02, 0.87, "\n".join([line1, line2, line3, line4]),ha="left", va="top", fontsize=10, family="monospace")
 
-    # stats table axes positioned just below subtitle
-    ax_tbl = fig.add_axes([0.02, 0.62, 0.96, 0.25])  # left, bottom, width, height
+    # first statistics table
+    fig.text(0.02, 0.75, "Statistics", ha="left", va="bottom", fontsize=11, fontweight="bold")
+    ax_tbl = fig.add_axes([0.02, 0.72, 0.96, 0.25])
     ax_tbl.axis("off")
     tbl = ax_tbl.table(
         cellText=results,
@@ -629,6 +650,87 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(8)
     tbl.scale(1, 1.5)
+
+    # -------------------------------------------------------------------------
+     # compute runs for state summaries
+    runs = []  # list of (regime, start, end, duration_days, return)
+    regime_series = df['regime']
+    dates = df.index
+    prev = regime_series.iloc[0]
+    start = dates[0]
+    for dt, curr in zip(dates[1:], regime_series.iloc[1:]):
+        if curr != prev:
+            end = dt
+            duration = (end - start).days
+            # extract scalar prices
+            price_in = df['Close'].loc[start]
+            price_in = float(price_in.iloc[0]) if hasattr(price_in, 'iloc') else float(price_in)
+            price_out = df['Close'].loc[end]
+            price_out = float(price_out.iloc[0]) if hasattr(price_out, 'iloc') else float(price_out)
+            run_return = price_out/price_in - 1
+            runs.append((prev, start, end, duration, run_return))
+            prev = curr
+            start = dt
+    # current run
+    duration = (dates[-1] - start).days
+    price_in = df['Close'].loc[start]
+    price_in = float(price_in.iloc[0]) if hasattr(price_in, 'iloc') else float(price_in)
+    price_out = df['Close'].iloc[-1]
+    price_out = float(price_out.iloc[0]) if hasattr(price_out, 'iloc') else float(price_out)
+    run_return = price_out/price_in - 1
+    runs.append((prev, start, None, duration, run_return))
+
+    # build combined summary rows
+    combined = []
+    for regime in _active_regimes():
+        state_runs = [r for r in runs if r[0] == regime]
+        # length stats
+        dur_list = [r[3] for r in state_runs]
+        avg_len = int(np.mean(dur_list)) if dur_list else 0
+        med_len = int(np.median(dur_list)) if dur_list else 0
+        max_len = max(dur_list) if dur_list else 0
+        min_len = min(dur_list) if dur_list else 0
+        # run returns
+        ret_list = [r[4] for r in state_runs]
+        avg_run_ret = round(np.mean(ret_list),4) if ret_list else 0.0
+        # hit rate
+        if regime in ['bull','extreme_bull']:
+            hits = sum(r > 0 for r in ret_list)
+        else:
+            hits = sum(r < 0 for r in ret_list)
+        hit_rate = round(hits / len(ret_list),3) if ret_list else 0.0
+        # last switch
+        last_run = state_runs[-1] if state_runs else (regime, None, None, 0, 0)
+        date_in = last_run[1].strftime('%Y-%m-%d') if last_run[1] else ''
+        date_out = last_run[2].strftime('%Y-%m-%d') if last_run[2] else ''
+        dur_days = last_run[3]
+        next_state = ''
+        if last_run[2] is not None:
+            idx = df.index.get_loc(last_run[2])
+            if idx+1 < len(df): next_state = df['regime'].iloc[idx+1]
+        combined.append([
+            regime, date_in, date_out, dur_days,
+            round(last_run[4],4), next_state,
+            avg_len, med_len, max_len, min_len,
+            avg_run_ret, hit_rate
+        ])
+    combined_labels = [
+        "Regime","DateIn","DateOut","DurDays","LastRet","NextState",
+        "AvgLen","MedLen","MaxLen","MinLen","AvgRunRet","HitRate"
+    ]
+
+    # combined table
+    fig.text(0.02, 0.50, "State Summary (Last Switch, Length & Performance)", ha="left", va="bottom",
+             fontsize=11, fontweight="bold")
+    ax_comb = fig.add_axes([0.02, 0.47, 0.96, 0.28])
+    ax_comb.axis('off')
+    tbl_comb = ax_comb.table(
+        cellText=combined,
+        colLabels=combined_labels,
+        cellLoc='center',
+        colWidths=[0.09,0.09,0.09,0.06,0.06,0.08,0.06,0.06,0.06,0.06,0.08,0.06]
+    )
+    tbl_comb.auto_set_font_size(False); tbl_comb.set_fontsize(8); tbl_comb.scale(1,1.2)
 
     plt.tight_layout()
     if pdf: pdf.savefig(fig)
