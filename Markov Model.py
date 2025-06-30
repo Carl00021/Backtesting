@@ -54,7 +54,7 @@ PROB_CONSEC_DAYS    = 5               # consecutive confirmations
 # Regime mapping --------------------------------------------------------------
 EXTREME_BEAR_Q      = 0.10
 EXTREME_BULL_Q      = 0.90
-NEUTRAL_PCT         = 0.2            # 0 ⇒ disable neutral regime
+NEUTRAL_PCT         = 0.3            # 0 ⇒ disable neutral regime
 
 REGIME_ORDER        = [
     "extreme_bull", "bull", "neutral", "bear", "extreme_bear"
@@ -72,6 +72,8 @@ VOL_Z_WINDOW        = 30
 VOL_WINDOW          = 20
 USE_VIX             = True
 VIX_TICKER          = "^VIX"
+USE_VVIX             = True
+VVIX_TICKER          = "^VVIX"
 USE_TLT             = False
 TLT_TICKER          = "^TNX"        # 20+ year Treasury ETF as rate proxy
 USE_SKEW            = True
@@ -113,6 +115,9 @@ def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     if USE_VIX:
         vix = _download_yf(VIX_TICKER, START_DATE, END_DATE)
         f["vix_ret"] = np.log(vix["Close"]).diff().reindex(df.index)
+    if USE_VVIX:
+        vvix = _download_yf(VVIX_TICKER, START_DATE, END_DATE)
+        f["vvix_ret"] = np.log(vvix["Close"]).diff().reindex(df.index)
     if USE_MOMENTUM:
         f["mom"] = (
             df["Close"]         # today's price
@@ -593,7 +598,7 @@ def _plot_summary_stats(df: pd.DataFrame, pdf: PdfPages | None = None):
     line1 = f"HMM: {MODEL_TYPE}, Cov: {COVARIANCE_TYPE}, N Mix: {N_MIX}, Stickiness: {STICKINESS}"
     line2 = f"Adaptive: window={ADAPTIVE_WINDOW}d, freq={ADAPTIVE_FREQ}d, thresh={PROB_THRESH:.2f}, days={PROB_CONSEC_DAYS:.2f}"
     line3 = f"Regime mapping: Q_lo={EXTREME_BEAR_Q}, Q_hi={EXTREME_BULL_Q}, NeuPct={NEUTRAL_PCT}"
-    line4 = f"Features: Momentum={USE_MOMENTUM}, HighLow={USE_SPREAD}, VIX={USE_VIX}, SKEW={USE_SKEW}, TLT={USE_TLT}, MOVE={USE_MOVE}"
+    line4 = f"Features: Momentum={USE_MOMENTUM}, HighLow={USE_SPREAD}, VIX={USE_VIX}, VVIX={USE_VVIX}, SKEW={USE_SKEW}, TLT={USE_TLT}, MOVE={USE_MOVE}"
 
     # compute performance statistics (existing)
     results = []
