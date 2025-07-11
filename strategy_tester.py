@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import inspect
+import warnings
 from pathlib import Path
 import datetime as dt
 
@@ -188,7 +189,6 @@ def simulate_portfolio(
     pos_series = pd.Series(position, index=price.index)
     return equity, trades, pos_series
 
-
 def add_metrics_table(pdf, metrics_df, title):
     # Prepare the subset & orientation logic as before
     rows, cols = metrics_df.shape
@@ -231,21 +231,27 @@ def add_metrics_table(pdf, metrics_df, title):
         col_widths = [l/total_len for l in max_lens]
 
         # Auto font sizing
-        fs = max(6, min(10, 400 / max(sub.shape)))
+        fs = max(6, min(10, 500 / max(sub.shape)))
 
+        # Draw the title at the top with a little padding
+        ax.set_title(title, fontweight="bold", fontsize=fs+2, pad=20)
+
+        # Place the table in the remaining area (below the title)
         tbl = ax.table(
             cellText   = rows_text,
             colLabels  = col_labels,
             colWidths  = col_widths,
-            loc        = "center",
+            loc        = "upper center",
             cellLoc    = "center",
             colLoc     = "center",
+            bbox       = [0.0, 0.0, 1.0, 0.95]   # [x, y, width, height]
         )
         tbl.auto_set_font_size(False)
         tbl.set_fontsize(fs)
-        tbl.scale(1, 1.0)
+        tbl.scale(1.0, 1.0)
 
-        ax.set_title(title, fontweight="bold", fontsize=fs+2)
+        # tighten only inside the lower 80% so title isn't squashed
+        fig.tight_layout(rect=[0, 0, 1, 0.9])
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
@@ -279,6 +285,7 @@ def main():
         default=INIT_CASH_DEFAULT
     )
     args = parser.parse_args()
+    model_params = vars(args)
 
     # parse leverage
     levs = [float(x) for x in args.leverage.split(",")]
@@ -369,8 +376,12 @@ def main():
         win_rate = wins / len(trades_k) if trades_k else np.nan
         last_td  = trades_k[-1]["exit_date"] if trades_k else pd.NaT
 
+        lev_str = key.split("_")[-1]           # e.g. "3.0x"
+        lev_val = float(lev_str.rstrip("x"))   # → 3.0
+
         metrics.append({
             "Strategy":   key,
+            "Leverage":   lev_val,
             "TotalReturn": total_rt,
             "Sharpe":      sharpe,
             "Calmar":      calmar,
@@ -392,12 +403,151 @@ def main():
     # Generate PDF report for top 3 by TotalReturn
     pdf_path= outdir / f"strategy_report-{dt.datetime.today().date()}.pdf"
     with PdfPages(pdf_path) as pdf:
+        # ───────────────────────────────────────────────────────────
+        # PAGE 0: Parameters Summary
+        # ───────────────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(8.5, 11))
+        ax.axis("off")
+
+        # Title
+        title_str = f"{args.ticker} - Back Test {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ax.text(0.5, 0.97, title_str, va="top", ha="center", fontsize=16, fontweight="bold")
+
+        # “Parameters:” subtitle
+        ax.text(0.01, 0.92, "Parameters:", va="top", ha="left", fontsize=14, fontweight="bold")
+
+        # Parameters list, keep a handle for bbox measurement
+        param_lines = [f"{name}: {value}" for name, value in model_params.items()]
+        param_txt = "\n".join(param_lines)
+        param_text_obj = ax.text(
+            0.01, 0.90,
+            param_txt,
+            va="top",
+            ha="left",
+            fontsize=12,
+            family="monospace"
+        )
+
+        # Force a draw so we can measure
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        bbox = param_text_obj.get_window_extent(renderer=renderer)
+
+        # Convert bbox from display coords to axes coords
+        # We grab the bottom‐left corner (x0,y0)
+        x0_ax, y0_ax = ax.transAxes.inverted().transform((bbox.x0, bbox.y0))
+
+        # Position “Strategies:” 5% below that bottom
+        strategies_y = y0_ax - 0.05
+        strategies_y = max(strategies_y, 0.01)  # don’t go below the page
+
+        # “Strategies:” subtitle
+        ax.text(
+            0.01, strategies_y,
+            "Strategies:",
+            va="top",
+            ha="left",
+            fontsize=14,
+            fontweight="bold"
+        )
+
+        # List out your registry just below the subtitle
+        strategy_lines = [f"- {s}" for s in STRATEGY_REGISTRY]
+        ax.text(
+            0.01, strategies_y - 0.02,
+            "\n".join(strategy_lines),
+            va="top",
+            ha="left",
+            fontsize=12,
+            family="monospace"
+        )
+
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # ───────────────────────────────────────────────────────────
+        # MAP PAGE: two plots, color-coded by leverage + best-fit curve
+        # ───────────────────────────────────────────────────────────
+        # prep data as percentages
+        x1 = metrics_df["MaxDD%"] * 100
+        y1 = metrics_df["TotalReturn"] * 100
+
+        x2 = metrics_df["WinRate"] * 100
+        y2 = metrics_df["TotalReturn"] * 100
+
+        # extract leverage, coerce non-numeric (dynamic) to NaN so we ignore them
+        lev_raw = metrics_df.get("Leverage", pd.Series(1, index=metrics_df.index))
+        lev = pd.to_numeric(lev_raw, errors="coerce")
+
+        # build a palette for each static leverage level
+        unique_levs = sorted(lev.dropna().unique())      # e.g. [1, 3, 10]
+        cmap = plt.get_cmap("tab10")
+        color_map = {v: cmap(i) for i, v in enumerate(unique_levs)}
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.5, 11), sharex=False)
+
+        # — Top: Total Return vs Max Drawdown —
+        for v in unique_levs:
+            mask = lev == v
+            ax1.scatter(
+                x1[mask], y1[mask],
+                label=f"Lev {int(v)}×",
+                alpha=0.7,
+                color=color_map[v]
+            )
+        ax1.set_xlabel("Max Drawdown (%)")
+        ax1.set_ylabel("Total Return (%)")
+        ax1.set_title("Total Return vs Max Drawdown")
+        ax1.grid(True, linestyle="--", alpha=0.5)
+
+        # overall 2nd-degree best-fit
+        mask1 = np.isfinite(x1) & np.isfinite(y1)
+        x1_clean = x1[mask1]
+        y1_clean = y1[mask1]
+        if x1_clean.size > 2:
+            coeffs1 = np.polyfit(x1_clean, y1_clean, deg=2)
+            xs1 = np.linspace(x1_clean.min(), x1_clean.max(), 200)
+            ys1 = np.polyval(coeffs1, xs1)
+            ax1.plot(xs1, ys1, label="Best-fit (deg=2)", linewidth=2)
+            ax1.legend(title="Leverage")
+
+        # — Bottom: Total Return vs Hit Rate —
+        for v in unique_levs:
+            mask = lev == v
+            ax2.scatter(
+                x2[mask], y2[mask],
+                label=f"Lev {int(v)}×",
+                alpha=0.7,
+                color=color_map[v]
+            )
+        ax2.set_xlabel("Hit Rate (%)")
+        ax2.set_ylabel("Total Return (%)")
+        ax2.set_title("Total Return vs Hit Rate")
+        ax2.grid(True, linestyle="--", alpha=0.5)
+
+        # overall 2nd-degree best-fit
+        mask2 = np.isfinite(x2) & np.isfinite(y2)
+        x2_clean = x2[mask2]
+        y2_clean = y2[mask2]
+        if x2_clean.size > 2:
+            coeffs2 = np.polyfit(x2_clean, y2_clean, deg=2)
+            xs2 = np.linspace(x2_clean.min(), x2_clean.max(), 200)
+            ys2 = np.polyval(coeffs2, xs2)
+            ax2.plot(xs2, ys2, label="Best-fit (deg=2)", linewidth=2)
+            ax2.legend(title="Leverage")
+
+        # save this as one page
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
         # Page 1: top 10 by TotalReturn
-        top10_ret = metrics_df.nlargest(25, "TotalReturn")
+        top10_ret = metrics_df.nlargest(20, "TotalReturn")
         add_metrics_table(pdf, top10_ret, "Top 10 Strategies by Total Return")
 
         # Page 2: top 10 by WinRate
-        top10_win = metrics_df.nlargest(25, "WinRate")
+        top10_win = metrics_df.nlargest(20, "WinRate")
         add_metrics_table(pdf, top10_win, "Top 10 Strategies by Win Rate")
 
         # Pages for each top strategy
