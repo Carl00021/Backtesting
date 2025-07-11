@@ -95,99 +95,171 @@ def load_macro_series() -> dict[str, pd.Series]:
     unrate = fred.get_series("UNRATE")
     return {"CPIAUCSL": cpi, "UNRATE": unrate}
 
+# ---------------------------------------------------------------------------
+# Portfolio simulator — handles both “always-on” (buy-and-hold) strategies
+# and same-bar round-trip Buy-the-Dip (BTD_*) variants.
+#
+# Key fixes vs. earlier versions
+#   • realised P/L from every exit (same-day or multi-day) is booked into equity
+#   • commission charged on each executed side and netted out of win/loss
+#   • win flag = True only when a trade beats its own commission
+#   • 1-day cooldown for dip strategies to avoid back-to-back entries
+# ---------------------------------------------------------------------------
 def simulate_portfolio(
     price: pd.Series,
     signals: dict[str, pd.Series],
     leverage: float,
     init_cash: float = INIT_CASH_DEFAULT
 ) -> tuple[pd.Series, list[dict], pd.Series]:
-    """
-    Simple daily P&L simulator:
-      - entries/exits at close of bar i
-      - commission = COMM_PER_TRADE * |Δposition| * equity_before_trade
-      - daily PnL = position_prev * equity_prev * daily_return
-      - position expressed in 'x' leverage units
-    Returns:
-      - equity curve (pd.Series)
-      - trade list with entry/exit dates + PnL + win flag
-    """
-    rets   = price.pct_change().fillna(0)
-    dates  = price.index
-    n      = len(price)
 
-    equity   = pd.Series(index=dates, dtype=float)
-    position = np.zeros(n, dtype=float)
+    dates     = price.index
+    rets      = price.pct_change().fillna(0.0)
+    n         = len(price)
 
-    equity.iloc[0]   = init_cash
-    position[0]      = 0.0
+    # Identify dip strategies by the presence of an entry_price series
+    is_dip_strategy = "entry_price" in signals
+    last_trade_date = None
 
-    trades = []
-    open_trade = None
+    equity   = pd.Series(np.nan, index=dates, dtype=float)
+    position = np.zeros(n,          dtype=float)
+    trades   = []
 
-    # ---------- NEW: handle an entry on bar-0 -----------------
+    # ----------------------------------------------------------------------
+    # Day-0: open a position if the strategy fires immediately (buy-and-hold)
+    # ----------------------------------------------------------------------
+    equity.iloc[0]  = init_cash
+    open_trade      = None
+
     if signals["entries"].iloc[0]:
-        position[0] = leverage * signals["size_pct"].iloc[0]
-        open_trade  = {
-            "entry_date":  dates[0],
-            "entry_price": price.iloc[0],
-            "leverage":    leverage,
+        entry_px   = signals.get("entry_price", price).iloc[0]
+        size_pct   = signals["size_pct"].iloc[0]
+        notional   = init_cash * leverage * size_pct
+        commission = COMM_PER_TRADE * notional            # one side
+
+        open_trade = {
+            "entry_date":    dates[0],
+            "entry_price":   entry_px,
+            "leverage":      leverage,
+            "size_pct":      size_pct,
+            "entry_notional": notional,                   # store for exit
         }
 
+        equity.iloc[0] -= commission                      # pay entry fee
+        position[0]     = leverage * size_pct
+        last_trade_date = dates[0]
+
+    # ----------------------------------------------------------------------
+    # Main loop
+    # ----------------------------------------------------------------------
     for i in range(1, n):
-        prev_eq   = equity.iloc[i-1]
-        prev_pos  = position[i-1]
+        prev_eq   = equity.iloc[i - 1]
+        prev_pos  = position[i - 1]
         date      = dates[i]
 
-        # 1) Determine desired position
-        if signals["entries"].iloc[i]:
-            desired_pos = leverage * signals["size_pct"].iloc[i]
-        elif signals["exits"].iloc[i]:
-            desired_pos = 0.0
-        else:
-            desired_pos = prev_pos
+        # -----------------------------
+        # Optional 1-day dip cooldown
+        # -----------------------------
+        if is_dip_strategy and signals["entries"].iloc[i]:
+            if last_trade_date == dates[i - 1]:
+                signals["entries"].iloc[i] = False   # veto today’s entry
 
-        # 2) Commission on position change
-        change     = desired_pos - prev_pos
-        commission = COMM_PER_TRADE * abs(change) * prev_eq
+        entry_exec = False
+        exit_exec  = False
+        desired_pos = prev_pos
 
-        # 3) Apply daily P&L on previous position
-        pnl        = prev_pos * prev_eq * rets.iloc[i]
-        eq_today   = prev_eq + pnl - commission
+        # -------------------------------------------------------------
+        # A) SAME-BAR round-trip (dip strategies only)
+        # -------------------------------------------------------------
+        if (is_dip_strategy and
+            signals["entries"].iloc[i] and
+            signals["exits"].iloc[i] and
+            open_trade is None):
 
-        equity.iloc[i] = eq_today
-        position[i]    = desired_pos
+            # --- entry side ---
+            entry_px   = signals.get("entry_price", price).iloc[i]
+            size_pct   = signals["size_pct"].iloc[i]
+            notional   = prev_eq * leverage * size_pct
+            comm_entry = COMM_PER_TRADE * notional
 
-        # 4) Record trades based on your entry/exit signals
-        # — record trades using the entry_price series (threshold fill) or fallback to close
-        entry_price_series = signals.get("entry_price", price)
+            # --- exit side ---
+            exit_px    = price.iloc[i]
+            pnl_raw    = (exit_px / entry_px) - 1.0
+            realised   = notional * pnl_raw
+            comm_exit  = COMM_PER_TRADE * notional
+            net_pnl    = realised - comm_entry - comm_exit
 
-        # Entry: fill at the threshold price (if provided) or at the close
-        if signals["entries"].iloc[i] and open_trade is None:
-            entry_price = entry_price_series.iloc[i]
-            open_trade = {
+            # book trade
+            trades.append({
                 "entry_date":  date,
-                "entry_price": entry_price,
-                "leverage":    leverage
-            }
+                "entry_price": entry_px,
+                "exit_date":   date,
+                "exit_price":  exit_px,
+                "pnl":         net_pnl,
+                "win":         net_pnl > 0,
+            })
 
-        elif signals["exits"].iloc[i] and open_trade is not None:
-            # Normal exit
-            exit_px = price.iloc[i]
-            pnl_px  = (exit_px - open_trade["entry_price"]) / open_trade["entry_price"]
+            # update ledger
+            equity.iloc[i] = prev_eq + net_pnl
+            position[i]    = 0.0
+            last_trade_date = date
+            continue  # nothing left to do for this bar
+
+        # -------------------------------------------------------------
+        # B) NORMAL multi-bar exit
+        # -------------------------------------------------------------
+        if signals["exits"].iloc[i] and open_trade is not None:
+            exit_exec  = True
+            desired_pos = 0.0
+
+            exit_px    = price.iloc[i]
+            notional   = open_trade["entry_notional"]
+            pnl_raw    = (exit_px / open_trade["entry_price"]) - 1.0
+            realised   = notional * pnl_raw
+            comm_exit  = COMM_PER_TRADE * notional
+            net_pnl    = realised - comm_exit
+
             open_trade.update({
-                "exit_date": date,
+                "exit_date":  date,
                 "exit_price": exit_px,
-                "pnl": pnl_px * leverage,
-                "win": pnl_px > 0,
+                "pnl":        net_pnl,
+                "win":        net_pnl > 0,
             })
             trades.append(open_trade)
             open_trade = None
+            last_trade_date = date
 
-    pos_series = pd.Series(position, index=price.index)
-    return equity, trades, pos_series
-    # wrap the raw numpy positions into a pd.Series
-    pos_series = pd.Series(position, index=price.index)
-    return equity, trades, pos_series
+        # -------------------------------------------------------------
+        # C) NORMAL entry (only if flat)
+        # -------------------------------------------------------------
+        if signals["entries"].iloc[i] and open_trade is None:
+            entry_exec  = True
+            size_pct    = signals["size_pct"].iloc[i]
+            entry_px    = signals.get("entry_price", price).iloc[i]
+            notional    = prev_eq * leverage * size_pct
+            comm_entry  = COMM_PER_TRADE * notional
+
+            open_trade = {
+                "entry_date":     date,
+                "entry_price":    entry_px,
+                "leverage":       leverage,
+                "size_pct":       size_pct,
+                "entry_notional": notional,
+            }
+            desired_pos     = leverage * size_pct
+            prev_eq        -= comm_entry             # pay entry fee
+            last_trade_date = date
+
+        # -------------------------------------------------------------
+        # D) Mark-to-market overnight P/L on carried position
+        # -------------------------------------------------------------
+        pnl_overnight = prev_pos * prev_eq * rets.iloc[i]
+
+        equity.iloc[i] = prev_eq + pnl_overnight
+        position[i]    = desired_pos
+
+    # ------------------------------------------------------------------
+    return equity, trades, pd.Series(position, index=dates)
+
 
 def add_metrics_table(pdf, metrics_df, title):
     # Prepare the subset & orientation logic as before
@@ -208,7 +280,7 @@ def add_metrics_table(pdf, metrics_df, title):
         col_labels = ["Strategy"] + sub.columns.tolist()
         rows_text  = []
         for idx in sub.index:
-            row = [shorten(idx, width=28, placeholder="…")]
+            row = [idx]
             for col in sub.columns:
                 val = sub.loc[idx, col]
                 # your existing fmt()
@@ -339,13 +411,17 @@ def main():
                 signals = strat.generate_signals()
                 signals["low"] = aux["low"]
                 # — for BuyDipPct, set the fill to prev_close*(1-threshold)
-                if name == "buy_dip_pct" and th is not None:
-                    # th is your threshold (e.g. 0.01)
-                    signals["entry_price"] = price.shift(1) * (1 - th)
+                if hasattr(strat, "threshold"):
+                    prev_close = price.shift(1)
+                    entry_price = price.copy()
+                    mask = signals["entries"].astype(bool)
+                    entry_price[mask] = prev_close[mask] * (1 - strat.threshold)
+                    signals["entry_price"] = entry_price
+
                 eq_curve, trades, pos_series = simulate_portfolio(
                 price, signals, lev, init_cash=args.init_cash
                 )
-                
+
                 # construct a key that only includes threshold if we used one
                 parts = [name]
                 if th is not None:
@@ -356,7 +432,7 @@ def main():
                 trade_books[key]   = trades
                 pos_dict[key]      = pos_series
                 print(f">>> {key}: final equity = {eq_curve.iloc[-1]:.4f}, "f"{len(trades)} trades")
-
+                
     # Build metrics table
     metrics = []
     for key, eq in equity_curves.items():
