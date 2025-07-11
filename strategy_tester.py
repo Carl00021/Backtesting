@@ -543,88 +543,161 @@ def main():
         plt.close(fig)
 
         # ───────────────────────────────────────────────────────────
-        # MAP PAGE: two plots, color-coded by leverage + best-fit curve
+        # MAP PAGE: two plots, color‐coded by leverage + best‐fit curve (with capped outliers)
         # ───────────────────────────────────────────────────────────
+
         # prep data as percentages
         x1 = metrics_df["MaxDD%"] * 100
         y1 = metrics_df["TotalReturn"] * 100
-
-        x2 = metrics_df["WinRate"] * 100
+        x2 = metrics_df["WinRate"]   * 100
         y2 = metrics_df["TotalReturn"] * 100
 
-        # extract leverage, coerce non-numeric (dynamic) to NaN so we ignore them
-        lev_raw = metrics_df.get("Leverage", pd.Series(1, index=metrics_df.index))
-        lev = pd.to_numeric(lev_raw, errors="coerce")
+        # leverage mapping
+        lev_raw     = metrics_df.get("Leverage", pd.Series(1, index=metrics_df.index))
+        lev         = pd.to_numeric(lev_raw, errors="coerce")
+        unique_levs = sorted(lev.dropna().unique())
+        cmap        = plt.get_cmap("tab10")
+        color_map   = {v: cmap(i) for i, v in enumerate(unique_levs)}
 
-        # build a palette for each static leverage level
-        unique_levs = sorted(lev.dropna().unique())      # e.g. [1, 3, 10]
-        cmap = plt.get_cmap("tab10")
-        color_map = {v: cmap(i) for i, v in enumerate(unique_levs)}
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.5, 11))
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.5, 11), sharex=False)
 
         # — Top: Total Return vs Max Drawdown —
+        mask1      = np.isfinite(x1) & np.isfinite(y1)
+        x1_clean   = x1[mask1]
+        y1_clean   = y1[mask1]
+        cap1       = np.percentile(y1_clean, 95)
+        y1_clamped = np.minimum(y1, cap1)
+
+        # scatter (clamped)
         for v in unique_levs:
-            mask = lev == v
+            idx = lev == v
             ax1.scatter(
-                x1[mask], y1[mask],
+                x1[idx], y1_clamped[idx],
                 label=f"Lev {int(v)}×",
                 alpha=0.7,
                 color=color_map[v]
             )
+
+        # best‐fit (degree=2) on uncapped data
+        if x1_clean.size > 2:
+            coeffs1 = np.polyfit(x1_clean, y1_clean, deg=2)
+            xs1     = np.linspace(x1_clean.min(), x1_clean.max(), 200)
+            ys1     = np.polyval(coeffs1, xs1)
+            ax1.plot(xs1, ys1, label="Best-fit (deg=2)", linewidth=2)
+
+        # ensure the y‐limit covers both the cap and the peak of the fit
+        if x1_clean.size > 2:
+            top1 = max(cap1 * 1.05, ys1.max() * 1.05)
+        else:
+            top1 = cap1 * 1.05
+
+        # outliers at cap
+        out1 = y1 > cap1
+        if out1.any():
+            # 1) scatter the X’s on top of everything
+            ax1.scatter(
+                x1[out1],
+                np.full(out1.sum(), cap1),
+                marker="X", s=80,
+                facecolors="none",
+                edgecolors="black",
+                label="Outliers",
+                zorder=10
+            )
+            # 2) label each with its true TotalReturn (y1) just below the X
+            for xi, yi in zip(x1[out1], y1[out1]):
+                ax1.text(
+                    xi,
+                    cap1 - (top1 * 0.03),      # a little below the cap line
+                    f"{yi:.1f}%",
+                    ha="center", va="top",
+                    fontsize=8,
+                    zorder=11
+                )
+
+        ax1.set_ylim(bottom=y1_clean.min(), top=top1)
         ax1.set_xlabel("Max Drawdown (%)")
         ax1.set_ylabel("Total Return (%)")
         ax1.set_title("Total Return vs Max Drawdown")
         ax1.grid(True, linestyle="--", alpha=0.5)
+        ax1.legend(title="Leverage")
 
-        # overall 2nd-degree best-fit
-        mask1 = np.isfinite(x1) & np.isfinite(y1)
-        x1_clean = x1[mask1]
-        y1_clean = y1[mask1]
-        if x1_clean.size > 2:
-            coeffs1 = np.polyfit(x1_clean, y1_clean, deg=2)
-            xs1 = np.linspace(x1_clean.min(), x1_clean.max(), 200)
-            ys1 = np.polyval(coeffs1, xs1)
-            ax1.plot(xs1, ys1, label="Best-fit (deg=2)", linewidth=2)
-            ax1.legend(title="Leverage")
 
         # — Bottom: Total Return vs Hit Rate —
+        mask2      = np.isfinite(x2) & np.isfinite(y2)
+        x2_clean   = x2[mask2]
+        y2_clean   = y2[mask2]
+        cap2       = np.percentile(y2_clean, 95)
+        y2_clamped = np.minimum(y2, cap2)
+
+        # scatter (clamped)
         for v in unique_levs:
-            mask = lev == v
+            idx = lev == v
             ax2.scatter(
-                x2[mask], y2[mask],
+                x2[idx], y2_clamped[idx],
                 label=f"Lev {int(v)}×",
                 alpha=0.7,
                 color=color_map[v]
             )
+
+        # best‐fit (degree=2) on uncapped data
+        if x2_clean.size > 2:
+            coeffs2 = np.polyfit(x2_clean, y2_clean, deg=2)
+            xs2     = np.linspace(x2_clean.min(), x2_clean.max(), 200)
+            ys2     = np.polyval(coeffs2, xs2)
+            ax2.plot(xs2, ys2, label="Best-fit (deg=2)", linewidth=2)
+
+        # y‐limit to cover cap and fit peak
+        if x2_clean.size > 2:
+            top2 = max(cap2 * 1.05, ys2.max() * 1.05)
+        else:
+            top2 = cap2 * 1.05
+
+        # outliers at cap
+        out2 = y2 > cap2
+        if out2.any():
+            ax2.scatter(
+                x2[out2],
+                np.full(out2.sum(), cap2),
+                marker="X", s=80,
+                facecolors="none",
+                edgecolors="black",
+                label="Outliers",
+                zorder=10
+            )
+            for xi, yi in zip(x2[out2], y2[out2]):
+                ax2.text(
+                    xi,
+                    cap2 - (top2 * 0.03),
+                    f"{yi:.1f}%",
+                    ha="center", va="top",
+                    fontsize=8,
+                    zorder=11
+                )
+
+
+        ax2.set_ylim(bottom=y2_clean.min(), top=top2)
         ax2.set_xlabel("Hit Rate (%)")
         ax2.set_ylabel("Total Return (%)")
         ax2.set_title("Total Return vs Hit Rate")
         ax2.grid(True, linestyle="--", alpha=0.5)
+        ax2.legend(title="Leverage")
 
-        # overall 2nd-degree best-fit
-        mask2 = np.isfinite(x2) & np.isfinite(y2)
-        x2_clean = x2[mask2]
-        y2_clean = y2[mask2]
-        if x2_clean.size > 2:
-            coeffs2 = np.polyfit(x2_clean, y2_clean, deg=2)
-            xs2 = np.linspace(x2_clean.min(), x2_clean.max(), 200)
-            ys2 = np.polyval(coeffs2, xs2)
-            ax2.plot(xs2, ys2, label="Best-fit (deg=2)", linewidth=2)
-            ax2.legend(title="Leverage")
 
-        # save this as one page
+        # save page
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
+
         # Page 1: top 10 by TotalReturn
-        top10_ret = metrics_df.nlargest(20, "TotalReturn")
-        add_metrics_table(pdf, top10_ret, "Top 10 Strategies by Total Return")
+        top10_ret = metrics_df.nlargest(30, "TotalReturn")
+        add_metrics_table(pdf, top10_ret, "Top 30 Strategies by Total Return")
 
         # Page 2: top 10 by WinRate
-        top10_win = metrics_df.nlargest(20, "WinRate")
-        add_metrics_table(pdf, top10_win, "Top 10 Strategies by Win Rate")
+        top10_win = metrics_df.nlargest(30, "WinRate")
+        add_metrics_table(pdf, top10_win, "Top 30 Strategies by Win Rate")
 
         # Pages for each top strategy
         top3 = metrics_df["TotalReturn"].nlargest(3).index
