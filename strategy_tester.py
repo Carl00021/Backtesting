@@ -4,7 +4,7 @@ Manual batch tester that ranks strategies, outputs CSV and a PDF chart-pack.
 Rewritten to remove vectorbt dependency and support leverage multipliers.
 
 Usage:
-    python strategy_tester.py --ticker SPY --start 2020-01-01 --end 2025-06-25 --leverage 1.0,3.0,10.0 --thresholds 0.005,0.01,0.02 --stop-loss 0.05 --init-cash 1.0
+    python strategy_tester.py --ticker SPY --start 2020-01-01 --end 2025-06-25 --leverage 1.0,3.0,10.0 --thresholds 0.005,0.01,0.02 --stop-loss 0.05
 """
 
 import argparse
@@ -28,9 +28,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -------------------- CONFIG -------------------------------------------------
-COMM_PER_TRADE     = 0.0025   # 0.25% per trade, on notional change
-CAPITAL_GAINS_TAX  = 0.20     # (not used here, but you can layer it in)
-INIT_CASH_DEFAULT  = 1.0
+COMM_PER_TRADE     = 0.0005   # 0.05% per trade, on notional change
+FIXED_COMM         = 10.0     # $10 per side, per trade
+CAPITAL_GAINS_TAX  = 0.25     # 25% on realized gains, applied annually
+INIT_CASH_DEFAULT  = 100_000.0
 
 fred = Fred()  # assumes FRED_API_KEY in env
 
@@ -95,16 +96,6 @@ def load_macro_series() -> dict[str, pd.Series]:
     unrate = fred.get_series("UNRATE")
     return {"CPIAUCSL": cpi, "UNRATE": unrate}
 
-# ---------------------------------------------------------------------------
-# Portfolio simulator — handles both “always-on” (buy-and-hold) strategies
-# and same-bar round-trip Buy-the-Dip (BTD_*) variants.
-#
-# Key fixes vs. earlier versions
-#   • realised P/L from every exit (same-day or multi-day) is booked into equity
-#   • commission charged on each executed side and netted out of win/loss
-#   • win flag = True only when a trade beats its own commission
-#   • 1-day cooldown for dip strategies to avoid back-to-back entries
-# ---------------------------------------------------------------------------
 def simulate_portfolio(
     price: pd.Series,
     signals: dict[str, pd.Series],
@@ -134,7 +125,7 @@ def simulate_portfolio(
         entry_px   = signals.get("entry_price", price).iloc[0]
         size_pct   = signals["size_pct"].iloc[0]
         notional   = init_cash * leverage * size_pct
-        commission = COMM_PER_TRADE * notional            # one side
+        commission = COMM_PER_TRADE * notional + FIXED_COMM          # one side
 
         open_trade = {
             "entry_date":    dates[0],
@@ -179,13 +170,13 @@ def simulate_portfolio(
             entry_px   = signals.get("entry_price", price).iloc[i]
             size_pct   = signals["size_pct"].iloc[i]
             notional   = prev_eq * leverage * size_pct
-            comm_entry = COMM_PER_TRADE * notional
+            comm_entry = COMM_PER_TRADE * notional + FIXED_COMM
 
             # --- exit side ---
             exit_px    = price.iloc[i]
             pnl_raw    = (exit_px / entry_px) - 1.0
             realised   = notional * pnl_raw
-            comm_exit  = COMM_PER_TRADE * notional
+            comm_exit  = COMM_PER_TRADE * notional + FIXED_COMM
             net_pnl    = realised - comm_entry - comm_exit
 
             # book trade
@@ -258,10 +249,37 @@ def simulate_portfolio(
         position[i]    = desired_pos
 
     # ------------------------------------------------------------------
+    # 4) Annual capital‐gains tax (closed trades only)
+    # ------------------------------------------------------------------
+    trades_df = pd.DataFrame(trades)
+
+    if not trades_df.empty and CAPITAL_GAINS_TAX > 0:
+        # keep only closed trades
+        closed = trades_df.dropna(subset=["exit_date"]).copy()
+        closed["year"] = pd.DatetimeIndex(closed["exit_date"]).year
+
+        # sum only positive‐pnl closed trades by year
+        gains_by_year = (
+            closed.loc[closed["pnl"] > 0]
+                .groupby("year")["pnl"]
+                .sum()
+        )
+
+        for yr, total_gain in gains_by_year.items():
+            tax = total_gain * CAPITAL_GAINS_TAX
+            # last trading day of that calendar year
+            year_dates = equity.index[equity.index.year == yr]
+            if not year_dates.empty:
+                last_day = year_dates.max()
+                equity.loc[last_day:] -= tax
+
+    # ------------------------------------------------------------------
     return equity, trades, pd.Series(position, index=dates)
 
-
 def add_metrics_table(pdf, metrics_df, title):
+    # remove unwanted columns
+    metrics_df = metrics_df.drop(columns=["Leverage", "TotalReturn"], errors="ignore")
+
     # Prepare the subset & orientation logic as before
     rows, cols = metrics_df.shape
     max_rows_per_page = 42
@@ -284,7 +302,7 @@ def add_metrics_table(pdf, metrics_df, title):
             for col in sub.columns:
                 val = sub.loc[idx, col]
                 # your existing fmt()
-                if col in ("TotalReturn","MaxDD%","WinRate"):
+                if col in ("TotalReturn","MaxDD%","WinRate","CAGR"):
                     cell = f"{val*100:0.1f}%"
                 elif col == "Position":
                     cell = f"{int(val)}"
@@ -303,7 +321,7 @@ def add_metrics_table(pdf, metrics_df, title):
         col_widths = [l/total_len for l in max_lens]
 
         # Auto font sizing
-        fs = max(6, min(10, 500 / max(sub.shape)))
+        fs = max(6, min(8, 300 / max(sub.shape)))
 
         # Draw the title at the top with a little padding
         ax.set_title(title, fontweight="bold", fontsize=fs+2, pad=20)
@@ -442,7 +460,11 @@ def main():
 
         dd       = eq / eq.cummax() - 1
         max_dd   = dd.min()
-        total_rt = eq.iloc[-1] / args.init_cash - 1
+        total_rt = eq.iloc[-1] / args.init_cash - 1.0
+        days  = (eq.index[-1] - eq.index[0]).days
+        years = days / 365.25
+        cagr  = (eq.iloc[-1] / args.init_cash) ** (1/years) - 1
+
         calmar   = total_rt / abs(max_dd) if max_dd != 0 else np.nan
 
         trades_k = trade_books[key]            # ← correct list
@@ -456,9 +478,10 @@ def main():
         lev_val = float(lev_str.rstrip("x"))   # → 3.0
 
         metrics.append({
-            "Strategy":   key,
-            "Leverage":   lev_val,
+            "Strategy":    key,
+            "Leverage":    lev_val,
             "TotalReturn": total_rt,
+            "CAGR":        cagr,
             "Sharpe":      sharpe,
             "Calmar":      calmar,
             "MaxDD%":      max_dd,
@@ -500,7 +523,7 @@ def main():
             param_txt,
             va="top",
             ha="left",
-            fontsize=12,
+            fontsize=10,
             family="monospace"
         )
 
@@ -514,7 +537,7 @@ def main():
         x0_ax, y0_ax = ax.transAxes.inverted().transform((bbox.x0, bbox.y0))
 
         # Position “Strategies:” 5% below that bottom
-        strategies_y = y0_ax - 0.05
+        strategies_y = y0_ax - 0.02
         strategies_y = max(strategies_y, 0.01)  # don’t go below the page
 
         # “Strategies:” subtitle
@@ -534,7 +557,7 @@ def main():
             "\n".join(strategy_lines),
             va="top",
             ha="left",
-            fontsize=12,
+            fontsize=10,
             family="monospace"
         )
 
@@ -548,9 +571,7 @@ def main():
 
         # prep data as percentages
         x1 = metrics_df["MaxDD%"] * 100
-        y1 = metrics_df["TotalReturn"] * 100
-        x2 = metrics_df["WinRate"]   * 100
-        y2 = metrics_df["TotalReturn"] * 100
+        y1 = metrics_df["CAGR"]  * 100
 
         # leverage mapping
         lev_raw     = metrics_df.get("Leverage", pd.Series(1, index=metrics_df.index))
@@ -561,131 +582,147 @@ def main():
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.5, 11))
 
+        # — Top: CAGR vs Max Drawdown —
+        # mask NaNs
+        mask = np.isfinite(x1) & np.isfinite(y1)
+        x = x1[mask]
+        y = y1[mask]
+        lev = metrics_df["Leverage"][mask]
 
-        # — Top: Total Return vs Max Drawdown —
-        mask1      = np.isfinite(x1) & np.isfinite(y1)
-        x1_clean   = x1[mask1]
-        y1_clean   = y1[mask1]
-        cap1       = np.percentile(y1_clean, 95)
-        y1_clamped = np.minimum(y1, cap1)
+        # compute 95th‐pct cap and best‐fit curve
+        cap   = np.percentile(y, 99)
+        coeff = np.polyfit(x, y, 2)
+        xs    = np.linspace(x.min(), x.max(), 200)
+        ys    = np.polyval(coeff, xs)
 
-        # scatter (clamped)
+        # decide the y‐axis top (bigger of cap or parabola peak)
+        peak    = ys.max()
+        y_top   = max(cap, peak) * 1.05
+
+        # split inliers vs outliers
+        is_out = y > cap
+        in_x   = x[~is_out]
+        in_y   = y[~is_out]
+        out_x  = x[is_out]
+
+        # — plot inliers at their true y —
         for v in unique_levs:
-            idx = lev == v
+            idx = (lev == v) & (~is_out)
             ax1.scatter(
-                x1[idx], y1_clamped[idx],
+                in_x[idx], in_y[idx],
                 label=f"Lev {int(v)}×",
-                alpha=0.7,
-                color=color_map[v]
+                color=color_map[v],
+                alpha=0.7
             )
 
-        # best‐fit (degree=2) on uncapped data
-        if x1_clean.size > 2:
-            coeffs1 = np.polyfit(x1_clean, y1_clean, deg=2)
-            xs1     = np.linspace(x1_clean.min(), x1_clean.max(), 200)
-            ys1     = np.polyval(coeffs1, xs1)
-            ax1.plot(xs1, ys1, label="Best-fit (deg=2)", linewidth=2)
-
-        # ensure the y‐limit covers both the cap and the peak of the fit
-        if x1_clean.size > 2:
-            top1 = max(cap1 * 1.05, ys1.max() * 1.05)
-        else:
-            top1 = cap1 * 1.05
-
-        # outliers at cap
-        out1 = y1 > cap1
-        if out1.any():
-            # 1) scatter the X’s on top of everything
+        # — plot outlier circles at y_top —
+        for v in unique_levs:
+            idx = (lev == v) & (is_out)
             ax1.scatter(
-                x1[out1],
-                np.full(out1.sum(), cap1),
+                out_x[idx], 
+                [y_top]*idx.sum(),
+                label=None,  # already in legend via the inliers
+                color=color_map[v],
+                alpha=0.7
+            )
+
+        # — draw best‐fit curve —
+        ax1.plot(xs, ys, label="Best-fit (deg=2)", linewidth=2)
+
+        # — draw X markers at y_top for outliers and label them —
+        if is_out.any():
+            ax1.scatter(
+                out_x, [y_top]*is_out.sum(),
                 marker="X", s=80,
-                facecolors="none",
-                edgecolors="black",
+                facecolors="none", edgecolors="black",
                 label="Outliers",
                 zorder=10
             )
-            # 2) label each with its true TotalReturn (y1) just below the X
-            for xi, yi in zip(x1[out1], y1[out1]):
+            for xi, yi in zip(out_x, y[is_out]):
                 ax1.text(
-                    xi,
-                    cap1 - (top1 * 0.03),      # a little below the cap line
-                    f"{yi:.1f}%",
-                    ha="center", va="top",
-                    fontsize=8,
-                    zorder=11
+                    xi, y_top * 0.97, f"{yi:.1f}%",
+                    ha="center", va="top", fontsize=8
                 )
 
-        ax1.set_ylim(bottom=y1_clean.min(), top=top1)
+        ax1.set_ylim(bottom=y.min(), top=y_top)
         ax1.set_xlabel("Max Drawdown (%)")
-        ax1.set_ylabel("Total Return (%)")
-        ax1.set_title("Total Return vs Max Drawdown")
+        ax1.set_ylabel("CAGR (%)")
+        ax1.set_title("CAGR vs Max Drawdown")
         ax1.grid(True, linestyle="--", alpha=0.5)
         ax1.legend(title="Leverage")
 
+        # — Bottom: CAGR vs Hit Rate — (apply the same pattern)
+        x2 = metrics_df["WinRate"] * 100
+        y2 = metrics_df["CAGR"]  * 100   # <— use the new CAGR column
 
-        # — Bottom: Total Return vs Hit Rate —
-        mask2      = np.isfinite(x2) & np.isfinite(y2)
-        x2_clean   = x2[mask2]
-        y2_clean   = y2[mask2]
-        cap2       = np.percentile(y2_clean, 95)
-        y2_clamped = np.minimum(y2, cap2)
+        # mask NaNs
+        mask = np.isfinite(x2) & np.isfinite(y2)
+        x = x2[mask]
+        y = y2[mask]
+        lev = metrics_df["Leverage"][mask]
 
-        # scatter (clamped)
+        # compute 95th‐pct cap and best‐fit curve
+        cap   = np.percentile(y, 99)
+        coeff = np.polyfit(x, y, 2)
+        xs    = np.linspace(x.min(), x.max(), 200)
+        ys    = np.polyval(coeff, xs)
+
+        # decide the y‐axis top (bigger of cap or parabola peak)
+        peak    = ys.max()
+        y_top   = max(cap, peak) * 1.1
+
+        # split inliers vs outliers
+        is_out = y > cap
+        in_x   = x[~is_out]
+        in_y   = y[~is_out]
+        out_x  = x[is_out]
+
+        # — plot inliers at their true y —
         for v in unique_levs:
-            idx = lev == v
+            idx = (lev == v) & (~is_out)
             ax2.scatter(
-                x2[idx], y2_clamped[idx],
+                in_x[idx], in_y[idx],
                 label=f"Lev {int(v)}×",
-                alpha=0.7,
-                color=color_map[v]
+                color=color_map[v],
+                alpha=0.7
             )
 
-        # best‐fit (degree=2) on uncapped data
-        if x2_clean.size > 2:
-            coeffs2 = np.polyfit(x2_clean, y2_clean, deg=2)
-            xs2     = np.linspace(x2_clean.min(), x2_clean.max(), 200)
-            ys2     = np.polyval(coeffs2, xs2)
-            ax2.plot(xs2, ys2, label="Best-fit (deg=2)", linewidth=2)
-
-        # y‐limit to cover cap and fit peak
-        if x2_clean.size > 2:
-            top2 = max(cap2 * 1.05, ys2.max() * 1.05)
-        else:
-            top2 = cap2 * 1.05
-
-        # outliers at cap
-        out2 = y2 > cap2
-        if out2.any():
+        # — plot outlier circles at y_top —
+        for v in unique_levs:
+            idx = (lev == v) & (is_out)
             ax2.scatter(
-                x2[out2],
-                np.full(out2.sum(), cap2),
+                out_x[idx], 
+                [y_top]*idx.sum(),
+                label=None,  # already in legend via the inliers
+                color=color_map[v],
+                alpha=0.7
+            )
+
+        # — draw best‐fit curve —
+        ax2.plot(xs, ys, label="Best-fit (deg=2)", linewidth=2)
+
+        # — draw X markers at y_top for outliers and label them —
+        if is_out.any():
+            ax2.scatter(
+                out_x, [y_top]*is_out.sum(),
                 marker="X", s=80,
-                facecolors="none",
-                edgecolors="black",
+                facecolors="none", edgecolors="black",
                 label="Outliers",
                 zorder=10
             )
-            for xi, yi in zip(x2[out2], y2[out2]):
+            for xi, yi in zip(out_x, y[is_out]):
                 ax2.text(
-                    xi,
-                    cap2 - (top2 * 0.03),
-                    f"{yi:.1f}%",
-                    ha="center", va="top",
-                    fontsize=8,
-                    zorder=11
+                    xi, y_top * 0.97, f"{yi:.1f}%",
+                    ha="center", va="top", fontsize=8
                 )
 
-
-        ax2.set_ylim(bottom=y2_clean.min(), top=top2)
-        ax2.set_xlabel("Hit Rate (%)")
-        ax2.set_ylabel("Total Return (%)")
-        ax2.set_title("Total Return vs Hit Rate")
+        ax2.set_ylim(bottom=y.min(), top=y_top)
+        ax2.set_xlabel("Win Rate (%)")
+        ax2.set_ylabel("CAGR (%)")
+        ax2.set_title("CAGR vs Win Rate")
         ax2.grid(True, linestyle="--", alpha=0.5)
         ax2.legend(title="Leverage")
 
-
-        # save page
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
