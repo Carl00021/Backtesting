@@ -5,6 +5,7 @@ Rewritten to remove vectorbt dependency and support leverage multipliers.
 
 Usage:
     python strategy_tester.py --ticker SPY --start 2020-01-01 --end 2025-06-25 --leverage 1.0,3.0,10.0 --thresholds 0.005,0.01,0.02 --stop-loss 0.05
+    python strategy_tester.py --ticker SPY --start 2020-01-01 --leverage  1,3,5 --thresholds 0.005,0.01,0.02 --stop-loss 0.05
 """
 
 import argparse
@@ -29,9 +30,9 @@ load_dotenv()
 
 # -------------------- CONFIG -------------------------------------------------
 COMM_PER_TRADE     = 0.0005   # 0.05% per trade, on notional change
-FIXED_COMM         = 10.0     # $10 per side, per trade
+FIXED_COMM         = 0     # $10 per side, per trade
 CAPITAL_GAINS_TAX  = 0.25     # 25% on realized gains, applied annually
-INIT_CASH_DEFAULT  = 100_000.0
+INIT_CASH_DEFAULT  = 1.0
 
 fred = Fred()  # assumes FRED_API_KEY in env
 
@@ -435,6 +436,9 @@ def main():
                     mask = signals["entries"].astype(bool)
                     entry_price[mask] = prev_close[mask] * (1 - strat.threshold)
                     signals["entry_price"] = entry_price
+
+                if "entry_price" not in signals:               # non-intraday models
+                    signals["entry_price"] = aux["open"].shift(-1)   # next day’s open
 
                 eq_curve, trades, pos_series = simulate_portfolio(
                 price, signals, lev, init_cash=args.init_cash
