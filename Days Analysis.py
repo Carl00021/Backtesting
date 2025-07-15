@@ -8,7 +8,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 TICKER       = "SPY"            # e.g. "^VIX", "AAPL", "SPY"
 START        = "2000-01-01"      # or None
 END          = None              # or "2025-07-08"
-MAX_X_DAYS   = 100               # clip any duration above this to the edge
+MAX_X_DAYS   = 200               # clip any duration above this to the edge
 MIN_MOVE_PCT = 5.0               # only show segments with ≥5% move
 # ────────────────────────────────────────────────────────────────
 
@@ -143,6 +143,8 @@ def plot_segment_scatter(df, title, pct_col, pdf, close=None, cmap="viridis"):
         df["year"],
         c=df[pct_col],
         cmap=cmap,
+        vmin=0,      
+        vmax=30, 
         s=50,
         edgecolor="k",
         alpha=0.8,
@@ -259,7 +261,7 @@ if __name__ == "__main__":
                 pct_col="drawdown_pct",
                 pdf=pdf,
                 close=close,           # ← pass here
-                cmap="Reds_r",
+                cmap="Reds",
             )
 
         # 2) Momentum-unwind
@@ -271,7 +273,7 @@ if __name__ == "__main__":
                 pct_col="unwind_pct",
                 pdf=pdf,
                 close=close,           # ← and pass here
-                cmap="Greens_r",
+                cmap="Greens",
             )
 
     print(f"✅ Saved charts to {TICKER}_drawdown_and_unwind.pdf")
