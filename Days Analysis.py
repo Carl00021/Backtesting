@@ -9,7 +9,8 @@ TICKER       = "SPY"            # e.g. "^VIX", "AAPL", "SPY"
 START        = "2000-01-01"      # or None
 END          = None              # or "2025-07-08"
 MAX_X_DAYS   = 200               # clip any duration above this to the edge
-MIN_MOVE_PCT = 5.0               # only show segments with ≥5% move
+MIN_MOVE_PCT = 5                 # only show segments with ≥5% move
+MIN_RETURN   = 10
 # ────────────────────────────────────────────────────────────────
 
 def get_close(ticker, start=START, end=END):
@@ -55,7 +56,7 @@ def compute_drawdown_segments(close):
     df["duration_clipped"] = df["duration"].clip(upper=MAX_X_DAYS)
     return df
 
-def compute_peaks_by_drawdown(close, drop_pct):
+def compute_peaks_by_drawdown(close, drop_pct, min_return=0.0):
     """
     Identify every run from trough → peak, where the peak is
     the highest point reached *before* a drop of drop_pct%.
@@ -131,6 +132,7 @@ def compute_peaks_by_drawdown(close, drop_pct):
     df = pd.DataFrame(segments)
     if not df.empty:
         df["duration_clipped"] = df["duration"].clip(upper=MAX_X_DAYS)
+        df = df[df["unwind_pct"] >= min_return]
     return df
 
 def plot_segment_scatter(df, title, pct_col, pdf, close=None, cmap="viridis"):
@@ -156,7 +158,10 @@ def plot_segment_scatter(df, title, pct_col, pdf, close=None, cmap="viridis"):
     ax.set_xlim(0, MAX_X_DAYS)
 
     # 2) explicitly label every single year on the y-axis
-    years = list(range(int(df["year"].min()), int(df["year"].max())+1))
+    today     = pd.to_datetime("today").normalize()
+    min_year  = int(df["year"].min())
+    max_year  = max(int(df["year"].max()), today.year)     # include current year
+    years     = list(range(min_year, max_year+1))
     ax.set_yticks(years)
     ax.set_yticklabels(years)
 
@@ -265,7 +270,7 @@ if __name__ == "__main__":
             )
 
         # 2) Momentum-unwind
-        df_un = compute_peaks_by_drawdown(close, MIN_MOVE_PCT)
+        df_un = compute_peaks_by_drawdown(close, MIN_MOVE_PCT,MIN_RETURN)
         if not df_un.empty:
             plot_segment_scatter(
                 df_un,
