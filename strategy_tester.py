@@ -45,7 +45,7 @@ def load_market_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     indexed by Date.
     Works whether yf.download gives (ticker,field) or (field,ticker) in its MultiIndex.
     """
-    symbols = [ticker, "^VIX", "^TNX"]
+    symbols = [ticker, "^VIX", "^VIX3M","^TNX"]
     raw = yf.download(symbols, start=start, end=end,
                       auto_adjust=True, progress=False)
 
@@ -98,184 +98,106 @@ def load_macro_series() -> dict[str, pd.Series]:
     return {"CPIAUCSL": cpi, "UNRATE": unrate}
 
 def simulate_portfolio(
-    price: pd.Series,
-    signals: dict[str, pd.Series],
-    leverage: float,
-    init_cash: float = INIT_CASH_DEFAULT
+    price:      pd.Series,
+    signals:    dict[str, pd.Series],
+    leverage:   float = 1.0,
+    init_cash:  float = 1.0,
+    comm_pct:   float = 0.0005,   # 0.05 % of notional on exit
+    fixed_comm: float = 0.0,      # e.g. $10/exit
+    cooldown_days: int = 3        # days to wait after an exit
 ) -> tuple[pd.Series, list[dict], pd.Series]:
-
-    dates     = price.index
-    rets      = price.pct_change().fillna(0.0)
-    n         = len(price)
-
-    # Identify dip strategies by the presence of an entry_price series
-    is_dip_strategy = "entry_price" in signals
-    last_trade_date = None
+    """
+    Marks positions to market daily.                    │
+    • Commission is only charged on exit.               │
+    • Entry → Exit order lets same-bar signals close.   │
+    Returns: equity curve, list-of-trades dicts, position % series.
+    """
+    dates   = price.index
+    rets    = price.pct_change().fillna(0.0).to_numpy()
 
     equity   = pd.Series(np.nan, index=dates, dtype=float)
-    position = np.zeros(n,          dtype=float)
+    position = pd.Series(0.0,  index=dates, dtype=float)
     trades   = []
 
-    # ----------------------------------------------------------------------
-    # Day-0: open a position if the strategy fires immediately (buy-and-hold)
-    # ----------------------------------------------------------------------
-    equity.iloc[0]  = init_cash
-    open_trade      = None
+    cash         = init_cash
+    cur_pos      = 0.0            # fraction of equity long (+) / short (–)
+    open_trade   = None           # None or dict
+    next_allowed = dates[0]
 
-    if signals["entries"].iloc[0]:
-        entry_px   = signals.get("entry_price", price).iloc[0]
-        size_pct   = signals["size_pct"].iloc[0]
-        notional   = init_cash * leverage * size_pct
-        commission = COMM_PER_TRADE * notional + FIXED_COMM          # one side
+    def _commission(notional: float) -> float:
+        return comm_pct * notional + fixed_comm
 
-        open_trade = {
-            "entry_date":    dates[0],
-            "entry_price":   entry_px,
-            "leverage":      leverage,
-            "size_pct":      size_pct,
-            "entry_notional": notional,                   # store for exit
-        }
+    for i, date in enumerate(dates):
 
-        equity.iloc[0] -= commission                      # pay entry fee
-        position[0]     = leverage * size_pct
-        last_trade_date = dates[0]
+        # ------------------------------------------------------------------
+        # 0) MTM on yesterday’s position (if any)
+        # ------------------------------------------------------------------
+        if i > 0 and cur_pos != 0.0:
+            cash += cur_pos * cash * rets[i]
 
-    # ----------------------------------------------------------------------
-    # Main loop
-    # ----------------------------------------------------------------------
-    for i in range(1, n):
-        prev_eq   = equity.iloc[i - 1]
-        prev_pos  = position[i - 1]
-        date      = dates[i]
+        # ------------------------------------------------------------------
+        # 1) ENTRY  (runs *before* exit)
+        # ------------------------------------------------------------------
+        if (open_trade is None
+                and signals["entries"].iloc[i]
+                and date >= next_allowed):
 
-        # -----------------------------
-        # Optional 1-day dip cooldown
-        # -----------------------------
-        if is_dip_strategy and signals["entries"].iloc[i]:
-            if last_trade_date == dates[i - 1]:
-                signals["entries"].iloc[i] = False   # veto today’s entry
-
-        entry_exec = False
-        exit_exec  = False
-        desired_pos = prev_pos
-
-        # -------------------------------------------------------------
-        # A) SAME-BAR round-trip (dip strategies only)
-        # -------------------------------------------------------------
-        if (is_dip_strategy and
-            signals["entries"].iloc[i] and
-            signals["exits"].iloc[i] and
-            open_trade is None):
-
-            # --- entry side ---
-            entry_px   = signals.get("entry_price", price).iloc[i]
-            size_pct   = signals["size_pct"].iloc[i]
-            notional   = prev_eq * leverage * size_pct
-            comm_entry = COMM_PER_TRADE * notional + FIXED_COMM
-
-            # --- exit side ---
-            exit_px    = price.iloc[i]
-            pnl_raw    = (exit_px / entry_px) - 1.0
-            realised   = notional * pnl_raw
-            comm_exit  = COMM_PER_TRADE * notional + FIXED_COMM
-            net_pnl    = realised - comm_entry - comm_exit
-
-            # book trade
-            trades.append({
-                "entry_date":  date,
-                "entry_price": entry_px,
-                "exit_date":   date,
-                "exit_price":  exit_px,
-                "pnl":         net_pnl,
-                "win":         net_pnl > 0,
-            })
-
-            # update ledger
-            equity.iloc[i] = prev_eq + net_pnl
-            position[i]    = 0.0
-            last_trade_date = date
-            continue  # nothing left to do for this bar
-
-        # -------------------------------------------------------------
-        # B) NORMAL multi-bar exit
-        # -------------------------------------------------------------
-        if signals["exits"].iloc[i] and open_trade is not None:
-            exit_exec  = True
-            desired_pos = 0.0
-
-            exit_px    = price.iloc[i]
-            notional   = open_trade["entry_notional"]
-            pnl_raw    = (exit_px / open_trade["entry_price"]) - 1.0
-            realised   = notional * pnl_raw
-            comm_exit  = COMM_PER_TRADE * notional
-            net_pnl    = realised - comm_exit
-
-            open_trade.update({
-                "exit_date":  date,
-                "exit_price": exit_px,
-                "pnl":        net_pnl,
-                "win":        net_pnl > 0,
-            })
-            trades.append(open_trade)
-            open_trade = None
-            last_trade_date = date
-
-        # -------------------------------------------------------------
-        # C) NORMAL entry (only if flat)
-        # -------------------------------------------------------------
-        if signals["entries"].iloc[i] and open_trade is None:
-            entry_exec  = True
-            size_pct    = signals["size_pct"].iloc[i]
-            entry_px    = signals.get("entry_price", price).iloc[i]
-            notional    = prev_eq * leverage * size_pct
-            comm_entry  = COMM_PER_TRADE * notional
+            entry_px  = signals.get("entry_price", price).iloc[i]
+            size_pct  = signals["size_pct"].iloc[i]          # 0-1 from strategy
+            cur_pos   = leverage * size_pct
+            notional  = cash * cur_pos
 
             open_trade = {
-                "entry_date":     date,
-                "entry_price":    entry_px,
-                "leverage":       leverage,
-                "size_pct":       size_pct,
-                "entry_notional": notional,
+                "entry_date":  date,
+                "entry_idx":   i,
+                "entry_price": entry_px,
+                "notional":    notional,
+                "equity_at_entry": cash,
             }
-            desired_pos     = leverage * size_pct
-            prev_eq        -= comm_entry             # pay entry fee
-            last_trade_date = date
 
-        # -------------------------------------------------------------
-        # D) Mark-to-market overnight P/L on carried position
-        # -------------------------------------------------------------
-        pnl_overnight = prev_pos * prev_eq * rets.iloc[i]
+        # ------------------------------------------------------------------
+        # 2) EXIT
+        # ------------------------------------------------------------------
+        if open_trade and signals["exits"].iloc[i]:
 
-        equity.iloc[i] = prev_eq + pnl_overnight
-        position[i]    = desired_pos
+            notional   = open_trade["notional"]
+            price_exit = price.iloc[i]
 
-    # ------------------------------------------------------------------
-    # 4) Annual capital‐gains tax (closed trades only)
-    # ------------------------------------------------------------------
-    trades_df = pd.DataFrame(trades)
+            # realise intraday gain only if we opened *today*
+            realised_gain = 0.0
+            if i == open_trade["entry_idx"]:
+                realised_gain = (price_exit / open_trade["entry_price"] - 1) * notional
+                cash += realised_gain
 
-    if not trades_df.empty and CAPITAL_GAINS_TAX > 0:
-        # keep only closed trades
-        closed = trades_df.dropna(subset=["exit_date"]).copy()
-        closed["year"] = pd.DatetimeIndex(closed["exit_date"]).year
+            # exit commission
+            cash -= _commission(notional)
 
-        # sum only positive‐pnl closed trades by year
-        gains_by_year = (
-            closed.loc[closed["pnl"] > 0]
-                .groupby("year")["pnl"]
-                .sum()
-        )
+            trades.append({
+                "entry_date":  open_trade["entry_date"],
+                "entry_price": open_trade["entry_price"],
+                "exit_date":   date,
+                "exit_price":  price_exit,
+                "pnl":         cash - open_trade["equity_at_entry"],
+                "win":         (cash - open_trade["equity_at_entry"]) > 0,
+            })
 
-        for yr, total_gain in gains_by_year.items():
-            tax = total_gain * CAPITAL_GAINS_TAX
-            # last trading day of that calendar year
-            year_dates = equity.index[equity.index.year == yr]
-            if not year_dates.empty:
-                last_day = year_dates.max()
-                equity.loc[last_day:] -= tax
+            open_trade   = None
+            cur_pos      = 0.0
+            next_allowed = date + pd.Timedelta(days=cooldown_days)
 
-    # ------------------------------------------------------------------
-    return equity, trades, pd.Series(position, index=dates)
+        # ------------------------------------------------------------------
+        # 3) Ledger
+        # ------------------------------------------------------------------
+        equity.iloc[i]   = cash
+        position.iloc[i] = cur_pos
+
+        # optional: stop-out on bankruptcy
+        if cash <= 0:
+            equity.iloc[i:]   = 0.0
+            position.iloc[i:] = 0.0
+            break
+
+    return equity, trades, position
 
 def add_metrics_table(pdf, metrics_df, title):
     # remove unwanted columns
@@ -400,6 +322,7 @@ def main():
         "low":    data["Low"],
         "volume": data["Volume"],
         "^VIX":   data["^VIX"],
+        "^VIX3M":   data["^VIX3M"],
         "^TNX":   data["^TNX"],
         **load_macro_series(),
     }
@@ -425,6 +348,8 @@ def main():
                     init_kwargs["stop_loss"] = args.stop_loss
                 if th is not None:
                     init_kwargs["threshold"] = th
+                if "max_leverage" in inspect.signature(Strat.__init__).parameters:
+                    init_kwargs["max_leverage"] = lev
 
                 strat = Strat(**init_kwargs)
                 signals = strat.generate_signals()
@@ -556,14 +481,29 @@ def main():
 
         # List out your registry just below the subtitle
         strategy_lines = [f"- {s}" for s in STRATEGY_REGISTRY]
-        ax.text(
-            0.01, strategies_y - 0.02,
-            "\n".join(strategy_lines),
-            va="top",
-            ha="left",
-            fontsize=10,
-            family="monospace"
-        )
+        max_per_col = 30
+
+        # build 3 columns
+        cols = [
+            strategy_lines[0 : max_per_col],
+            strategy_lines[max_per_col : 2 * max_per_col],
+            strategy_lines[2 * max_per_col :     ]
+        ]
+
+        # x‐positions for each column (in axes fraction)
+        xs = [0.01, 0.34, 0.67]
+        y0 = strategies_y - 0.02
+
+        for x, col in zip(xs, cols):
+            if not col:
+                continue
+            ax.text(
+                x, y0,
+                "\n".join(col),
+                va="top", ha="left",
+                fontsize=10, family="monospace",
+                transform=ax.transAxes
+            )
 
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches="tight")
@@ -731,7 +671,6 @@ def main():
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-
         # Page 1: top 10 by TotalReturn
         top10_ret = metrics_df.nlargest(30, "TotalReturn")
         add_metrics_table(pdf, top10_ret, "Top 30 Strategies by Total Return")
@@ -743,31 +682,79 @@ def main():
         # Pages for each top strategy
         top3 = metrics_df["TotalReturn"].nlargest(3).index
         for key in top3:
-            fig, axes = plt.subplots(3, 1, figsize=(8.5, 11), sharex=True)
+            # 0) build a win‐flag series and rolling rates ----
+            trades = trade_books[key]
+            if trades:
+                df_tr = pd.DataFrame(trades)
+                # ensure exit_date is datetime
+                df_tr["exit_date"] = pd.to_datetime(df_tr["exit_date"])
+                # make exit_date the index and sort
+                df_tr.set_index("exit_date", inplace=True)
+                df_tr.sort_index(inplace=True)
 
-            # 1) Price + trade markers
-            price.plot(ax=axes[0], title=f"{key} – Price & Trades", alpha=0.5)
-            entries = [t["entry_date"] for t in trade_books[key]]
-            exits   = [t["exit_date"]  for t in trade_books[key]]
-            axes[0].scatter(entries, price.loc[entries], marker="^", label="Entry", color="green")
-            axes[0].scatter(exits,   price.loc[exits],   marker="v", label="Exit",  color="red")
+                df_tr["win_int"] = df_tr["win"].astype(int)
+
+                win_rates = pd.DataFrame({
+                    "3-trade"    : df_tr["win_int"].rolling(3).mean(),
+                    "5-trade"    : df_tr["win_int"].rolling(5).mean(),
+                    "cumulative" : df_tr["win_int"].expanding().mean(),
+                })
+
+                # now reindex onto the full datetime index
+                win_rates = (
+                    win_rates
+                    .reindex(price.index)   # align to your price dates
+                    .ffill()                # carry last value forward
+                    .fillna(0.0)            # initial periods → zero
+                )
+            else:
+                win_rates = pd.DataFrame(
+                    0.0,
+                    index=price.index,
+                    columns=["3-trade","5-trade","cumulative"]
+                )
+
+            # --- 1) make a 4×1 shared-x figure ---
+            fig, axes = plt.subplots(4, 1, figsize=(8.5, 11),gridspec_kw={"height_ratios":[2,1,1,1]}, sharex=True)
+            
+            # 2) Price + trades
+            price.plot(ax=axes[0],title=f"{key} – Price & Trades",alpha=0.75,zorder=2)
+            sma200 = price.rolling(window=200, min_periods=1).mean()
+            axes[0].plot(price.index,sma200,label="200d SMA",alpha=0.5,linewidth=1,zorder=1)
+            pos = pos_dict[key]              # 0 → flat, ±… → in trade
+            entries = pos[(pos.shift(1)==0) & (pos!=0)].index
+            exits   = pos[(pos.shift(1)!=0) & (pos==0)].index
+            axes[0].scatter(entries,price.loc[entries],marker="^",color="green",label="Entry",s=50,zorder=5)
+            axes[0].scatter(exits,price.loc[exits],marker="v",color="red",label="Exit",s=50,zorder=5)
             axes[0].legend(loc="best")
 
-            # 2) Equity curve
-            equity_curves[key].plot(ax=axes[1], title=f"{key} – Equity Curve")
-            axes[1].set_ylabel("Equity Value")
+            # 3) Rolling win-rates
+            axes[1].plot(win_rates.index, win_rates["3-trade"],    label="3-trade")
+            axes[1].plot(win_rates.index, win_rates["5-trade"],    label="5-trade")
+            axes[1].plot(win_rates.index, win_rates["cumulative"], label="cumulative")
+            axes[1].set_ylabel("Win Rate")
+            axes[1].set_ylim(0,1)
+            axes[1].legend(loc="best")
+            axes[1].set_title(f"{key} – Rolling Win Rates")
 
-            # 3) Drawdown
+            # 4) Equity + leverage shading
+            axes[2].fill_between(pos.index, 0, pos, step='post', alpha=0.3, label='Leverage')
+            ax2 = axes[2].twinx()
+            equity_curves[key].plot(ax=ax2, label='Equity', title=f"{key} – Equity & Leverage")
+            axes[2].set_yticks([0, 1, pos.max()], labels=['0×','1×',f'{int(pos.max())}×']);  axes[2].set_ylabel('Leverage')
+            ax2.set_ylabel('Equity Value')
+            axes[2].legend(loc='upper left');  ax2.legend(loc='upper right')
+
+            # 5) Drawdown
             dd = equity_curves[key] / equity_curves[key].cummax() - 1
-            dd.plot(ax=axes[2], title=f"{key} – Drawdown Curve")
-            axes[2].set_ylabel("Drawdown")
+            dd.plot(ax=axes[3], title=f"{key} – Drawdown Curve")
+            axes[3].set_ylabel("Drawdown")
 
             plt.tight_layout()
-            pdf.savefig(fig)
+            pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
     print(f"Summary saved to: {outdir.resolve()}")
-
 
 if __name__ == "__main__":
     main()
