@@ -1,3 +1,4 @@
+import os
 import datetime as dt
 import pandas as pd
 import yfinance as yf
@@ -5,12 +6,13 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 # ─── CONFIG ─────────────────────────────────────────────────────
-TICKER       = "SPY"            # e.g. "^VIX", "AAPL", "SPY"
+TICKER       = "RKT"            # e.g. "^VIX", "AAPL", "SPY"
 START        = "2000-01-01"      # or None
 END          = None              # or "2025-07-08"
 MAX_X_DAYS   = 200               # clip any duration above this to the edge
 MIN_MOVE_PCT = 5                 # only show segments with ≥5% move
-MIN_RETURN   = 10
+MIN_RETURN   = 5
+REPORT_DIR   = "Reports"
 # ────────────────────────────────────────────────────────────────
 
 def get_close(ticker, start=START, end=END):
@@ -255,7 +257,13 @@ def plot_segment_scatter(df, title, pct_col, pdf, close=None, cmap="viridis"):
 if __name__ == "__main__":
     close = get_close(TICKER)
 
-    with PdfPages(f"{TICKER}_drawdown_and_rallies_{MIN_MOVE_PCT}%_{dt.datetime.today().date()}.pdf") as pdf:
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    PDF_PATH = os.path.join(
+        REPORT_DIR,
+        f"{TICKER}_drawdown_and_rallies_{MIN_MOVE_PCT}%_{dt.datetime.today().date()}.pdf",
+    )
+
+    with PdfPages(PDF_PATH) as pdf:
         # 1) Drawdowns
         df_dd = compute_drawdown_segments(close)
         df_dd = df_dd[df_dd["drawdown_pct"] >= MIN_MOVE_PCT]
